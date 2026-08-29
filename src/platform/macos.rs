@@ -196,7 +196,9 @@ real       600 alijoder    5u  IPv6  99995      0t0  TCP [::1]:3000             
     #[test]
     fn empty_output_returns_no_rows() {
         assert!(parse_lsof_listen("", 3000).is_empty());
-        assert!(parse_lsof_listen("COMMAND PID USER FD DEVICE SIZE/OFF NODE NAME\n", 3000).is_empty());
+        assert!(
+            parse_lsof_listen("COMMAND PID USER FD DEVICE SIZE/OFF NODE NAME\n", 3000).is_empty()
+        );
     }
 
     #[test]
@@ -211,8 +213,10 @@ real       600 alijoder    5u  IPv6  99995      0t0  TCP [::1]:3000             
     fn matching_a_different_port_keeps_only_matching_listeners() {
         // Same raw output, but searching port 8080 must ignore the two 3000
         // listeners entirely.
-        let (a, b) = (parse_lsof_listen(MOCK_LSOF, 8080).is_empty(),
-                      parse_lsof_listen(MOCK_LSOF, 3000).len());
+        let (a, b) = (
+            parse_lsof_listen(MOCK_LSOF, 8080).is_empty(),
+            parse_lsof_listen(MOCK_LSOF, 3000).len(),
+        );
         assert!(a);
         assert_eq!(b, 2);
     }
