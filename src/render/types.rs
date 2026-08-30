@@ -74,6 +74,9 @@ pub struct ProcessResult {
     pub name: String,
     pub command: Option<String>,
     pub user: Option<String>,
+    /// Process uptime in whole seconds, if recoverable. Serialized as
+    /// `uptime_seconds` to match the README's documented JSON contract.
+    #[serde(rename = "uptime_seconds")]
     pub uptime_secs: Option<u64>,
     pub cwd: Option<String>,
     /// How this row ended up (defaults to [`ProcessStatus::Info`]).

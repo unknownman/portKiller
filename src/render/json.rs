@@ -111,7 +111,7 @@ mod tests {
             "name",
             "command",
             "user",
-            "uptime_secs",
+            "uptime_seconds",
             "cwd",
             "status",
             "signal",

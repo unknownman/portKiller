@@ -23,6 +23,7 @@ use crate::kill::signal::SignalSender;
 use crate::kill::{KillConfig, KillOutcome, terminate_one};
 use crate::platform::PlatformProvider;
 use crate::process::Protocol;
+use crate::process::enrich::enrich_process;
 use crate::render::{
     PortResult, ProcessStatus, RunMode, SignalKind, TableOptions, render_json, render_table,
 };
@@ -155,7 +156,10 @@ fn inspect_ports(provider: &dyn PlatformProvider, ports: &[u16]) -> Vec<PortResu
     for &port in ports {
         match provider.get_processes_on_port(port) {
             Ok(procs) if procs.is_empty() => results.push(PortResult::free(port)),
-            Ok(procs) => results.push(PortResult::occupied(port, procs)),
+            Ok(procs) => {
+                let enriched = procs.into_iter().map(enrich_process).collect();
+                results.push(PortResult::occupied(port, enriched));
+            }
             Err(e) => results.push(PortResult::inspection_error(
                 port,
                 Protocol::Tcp,

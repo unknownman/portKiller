@@ -9,6 +9,8 @@
 
 use serde::Serialize;
 
+pub mod enrich;
+
 /// The network-layer protocol a process is bound to.
 ///
 /// Kept as an enum (not a bool) so the JSON output and future features (e.g.

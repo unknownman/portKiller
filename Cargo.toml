@@ -18,6 +18,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 comfy-table = "8"
 colored = "3"
+sysinfo = "0.30"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
