@@ -4,15 +4,17 @@
 //!
 //! 1. **Resolve** ports (expand ranges) — [`crate::cli::port`]
 //! 2. **Inspect** each port via [`PlatformProvider`]
-//! 3. **Bail early** if nothing is listening (exit 1)
-//! 4. **Dry-run** summary with no OS signals (exit 0)
+//! 3. **Render** the collected view models and decide the exit code
+//! 4. **Dry-run** annotates the STATUS column with what *would* happen
 //! 5. **Confirm** graceful kills with a `[y/N]` prompt
 //! 6. **Escalate** each process via [`terminate_one`] and verify
-//! 7. **Report** and map any failure to exit code 2
+//! 7. **Report** via the render layer and map any failure to exit code 2
 //!
-//! Rendering here is deliberately minimal (full table/JSON rendering lands in a
-//! later phase). All OS access is injected via [`PlatformProvider`] /
-//! [`SignalSender`] so the lifecycle is testable against mocks.
+//! All output — human and JSON alike — is produced by the pure [`crate::render`]
+//! module, which only receives the view models built here. The orchestrator
+//! decides *what* runs; rendering decides *how* it looks. All OS access is
+//! injected via [`PlatformProvider`] / [`SignalSender`] so the lifecycle is
+//! testable against mocks.
 
 use crate::cli::args::Cli;
 use crate::cli::port;
@@ -20,7 +22,10 @@ use crate::error::AppError;
 use crate::kill::signal::SignalSender;
 use crate::kill::{KillConfig, KillOutcome, terminate_one};
 use crate::platform::PlatformProvider;
-use crate::process::ProcessInfo;
+use crate::process::Protocol;
+use crate::render::{
+    PortResult, ProcessStatus, RunMode, SignalKind, TableOptions, render_json, render_table,
+};
 
 /// Injected dependencies for the execution lifecycle.
 pub struct Runner<'a> {
@@ -50,63 +55,78 @@ pub fn run(runner: &Runner, cli: &Cli, mut confirm: impl FnMut() -> bool) -> i32
         }
     };
 
-    // 2. Inspect
-    let occupied: Vec<(u16, ProcessInfo)> = match inspect_ports(runner.provider, &ports) {
-        Ok(list) => list,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return exit::USAGE_OR_INTERNAL;
-        }
-    };
+    // 2. Inspect. Per-port failures are captured into the view model instead of
+    //    aborting the run, so JSON mode can encode them and multi-port runs
+    //    keep going past one broken port.
+    let mut results = inspect_ports(runner.provider, &ports);
 
-    // 3. Bail early
-    if occupied.is_empty() {
-        println!("No processes found listening on requested ports.");
+    // 3. Early terminal states.
+    if results.iter().all(|r| r.is_free()) {
+        emit(&results, cli.json);
         return exit::NOTHING_FOUND;
+    }
+    if results.iter().all(|r| r.is_error()) {
+        emit(&results, cli.json);
+        return exit::USAGE_OR_INTERNAL;
     }
 
     let kill_intent = cli.kill || cli.force;
 
-    // 4. Dry-run: report what *would* happen, touch nothing.
+    // 4. Dry-run: annotate every row with what *would* happen, touch nothing.
     if cli.dry_run {
-        summarize_dry_run(&occupied, cli.force);
+        stamp_dry_run(&mut results, cli.force);
+        emit_mode(&results, cli.json, RunMode::DryRun);
         return exit::OK;
     }
 
     // 5. Confirm graceful kills (--force/-y skips the prompt).
     if kill_intent && !cli.force && !confirm() {
-        println!("Aborted. No processes were terminated.");
+        emit_mode(&results, cli.json, RunMode::Aborted);
         return exit::OK;
     }
 
     if !kill_intent {
-        // Inspect-only mode: nothing to do beyond what we already showed.
+        // Read-only mode: the rendered table is the whole story.
+        emit_mode(&results, cli.json, RunMode::Inspect);
         return exit::OK;
     }
 
-    // 6. Execute & verify
+    // 6. Execute & verify, recording every outcome onto its row.
     let mut any_failed = false;
-    for (port, process) in &occupied {
-        match terminate_one(
-            *port,
-            process,
-            cli.force,
-            runner.signals,
-            runner.provider,
-            &runner.cfg,
-        ) {
-            Ok(outcome) => {
-                report_outcome(&outcome);
-                if !outcome.is_success() {
+    for port_result in results.iter_mut().filter(|r| r.is_occupied()) {
+        let port = port_result.port;
+        for row in port_result.processes.iter_mut() {
+            match terminate_one(
+                port,
+                &row.to_process_info(),
+                cli.force,
+                runner.signals,
+                runner.provider,
+                &runner.cfg,
+            ) {
+                Ok(KillOutcome::GracefulSuccess { .. }) => {
+                    row.status = ProcessStatus::Terminated;
+                    row.signal = Some(SignalKind::Sigterm);
+                }
+                Ok(KillOutcome::ForcefulSuccess { .. }) => {
+                    row.status = ProcessStatus::Killed;
+                    row.signal = Some(SignalKind::Sigkill);
+                }
+                Ok(KillOutcome::Failed { reason, .. }) => {
+                    row.status = ProcessStatus::Failed;
+                    row.error = Some(reason);
+                    any_failed = true;
+                }
+                Err(e) => {
+                    row.status = ProcessStatus::Failed;
+                    row.error = Some(kill_error_text(&e, port, row.pid));
                     any_failed = true;
                 }
             }
-            Err(e) => {
-                eprintln!("error: {e}");
-                any_failed = true;
-            }
         }
     }
+
+    emit_mode(&results, cli.json, RunMode::Kill);
 
     // 7. Exit code: 2 if any kill failed.
     if any_failed {
@@ -116,40 +136,64 @@ pub fn run(runner: &Runner, cli: &Cli, mut confirm: impl FnMut() -> bool) -> i32
     }
 }
 
-/// Inspect every port and collect the `(port, process)` pairs in use.
-fn inspect_ports(
-    provider: &dyn PlatformProvider,
-    ports: &[u16],
-) -> Result<Vec<(u16, ProcessInfo)>, AppError> {
-    let mut occupied = Vec::new();
+/// Inspect every port, building one render view per requested port. A port
+/// that the OS refuses to inspect becomes an error-carrying view, never a
+/// fatal panic.
+fn inspect_ports(provider: &dyn PlatformProvider, ports: &[u16]) -> Vec<PortResult> {
+    let mut results = Vec::with_capacity(ports.len());
     for &port in ports {
-        let procs = provider.get_processes_on_port(port)?;
-        for p in procs {
-            occupied.push((port, p));
+        match provider.get_processes_on_port(port) {
+            Ok(procs) if procs.is_empty() => results.push(PortResult::free(port)),
+            Ok(procs) => results.push(PortResult::occupied(port, procs)),
+            Err(e) => results.push(PortResult::inspection_error(
+                port,
+                Protocol::Tcp,
+                e.to_string(),
+            )),
         }
     }
-    Ok(occupied)
+    results
 }
 
-fn summarize_dry_run(occupied: &[(u16, ProcessInfo)], force: bool) {
-    let signal = if force { "SIGKILL" } else { "SIGTERM" };
-    println!("Dry run — no signals sent. Would terminate with {signal}:");
-    for (port, p) in occupied {
-        println!("  port {port} → PID {} ({})", p.pid, p.name);
+/// Mark every occupied process row with the signal that `--dry-run` _would_
+/// have sent. No OS call is made.
+fn stamp_dry_run(results: &mut [PortResult], force: bool) {
+    let signal = SignalKind::from_force(force);
+    for port in results.iter_mut().filter(|r| r.is_occupied()) {
+        for row in &mut port.processes {
+            row.status = ProcessStatus::DryRun;
+            row.signal = Some(signal);
+        }
     }
 }
 
-fn report_outcome(outcome: &KillOutcome) {
-    match outcome {
-        KillOutcome::GracefulSuccess { port, pid } => {
-            println!("✅ Port {port} freed (PID {pid} terminated gracefully)");
-        }
-        KillOutcome::ForcefulSuccess { port, pid } => {
-            println!("✅ Port {port} freed (PID {pid} terminated forcefully)");
-        }
-        KillOutcome::Failed { port, pid, reason } => {
-            eprintln!("❌ Port {port} NOT freed (PID {pid}): {reason}");
-        }
+/// Normalise a signal-delivery error into an actionable, port-aware message.
+/// The raw `AccessDenied` display says "port 0" because the signal layer does
+/// not know its port; we supply that context here.
+fn kill_error_text(err: &AppError, port: u16, pid: u32) -> String {
+    match err {
+        AppError::AccessDenied { .. } => format!(
+            "permission denied signalling PID {pid} on port {port}; \
+             try running `pk` with sudo"
+        ),
+        other => other.to_string(),
+    }
+}
+
+/// Print either the JSON document or the default (inspect-mode) human view.
+fn emit(results: &[PortResult], json: bool) {
+    emit_mode(results, json, RunMode::Inspect);
+}
+
+/// Print either the JSON document or the human view for a given run mode.
+///
+/// JSON output is mode-agnostic: the per-row `status`/`signal` fields already
+/// describe the invocation, so `--json | jq` never sees human text mixed in.
+fn emit_mode(results: &[PortResult], json: bool, mode: RunMode) {
+    if json {
+        println!("{}", render_json(results));
+    } else {
+        print!("{}", render_table(results, &TableOptions::new(mode)));
     }
 }
 
@@ -170,6 +214,7 @@ pub fn prompt_confirm() -> bool {
 mod tests {
     use super::*;
     use crate::kill::signal::{Signal, SignalSender};
+    use crate::process::ProcessInfo;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -293,5 +338,36 @@ mod tests {
         );
         assert_eq!(code, exit::OK);
         assert_eq!(*calls.lock().unwrap(), vec![(1234, Signal::Kill)]);
+    }
+
+    #[test]
+    fn kill_failure_maps_to_exit_2() {
+        // A provider whose port never frees makes every kill end in
+        // KillOutcome::Failed, which must surface as exit code 2.
+        struct Stubborn {
+            processes: Vec<ProcessInfo>,
+        }
+        impl PlatformProvider for Stubborn {
+            fn get_processes_on_port(&self, _port: u16) -> Result<Vec<ProcessInfo>, AppError> {
+                Ok(self.processes.clone())
+            }
+            fn is_port_free(&self, _port: u16) -> Result<bool, AppError> {
+                Ok(false)
+            }
+        }
+        let provider = Stubborn {
+            processes: vec![ProcessInfo::bare(1234, "node".into())],
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let signals = Recorder {
+            calls: calls.clone(),
+        };
+        let code = run(
+            &runner(&provider, &signals),
+            &cli(&["3000"], true, false, false),
+            || true,
+        );
+        assert_eq!(code, exit::KILL_FAILED);
+        assert!(!calls.lock().unwrap().is_empty());
     }
 }

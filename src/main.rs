@@ -20,6 +20,7 @@ mod error;
 mod kill;
 mod platform;
 mod process;
+mod render;
 
 use app::Runner;
 use clap::Parser;
