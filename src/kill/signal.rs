@@ -78,6 +78,20 @@ pub struct OsSignals;
 #[cfg(unix)]
 impl SignalSender for OsSignals {
     fn send(&self, pid: u32, signal: Signal) -> Result<(), AppError> {
+        // Safety guard: POSIX signalling is a broadcast footgun.
+        //   * pid == 0 signals the entire process group.
+        //   * casting pid to the signed `pid_t` wraps values above i32::MAX
+        //     into negatives (e.g. u32::MAX -> -1), and kill(-1) signals every
+        //     process the user may terminate.
+        // A single discovery bug must never be able to wipe the user's session,
+        // so reject these PIDs outright before the unsafe call.
+        if pid == 0 || pid > i32::MAX as u32 {
+            return Err(AppError::internal(format!(
+                "refusing to signal PID {pid}: invalid PID (would target a process group or \
+                 every process)"
+            )));
+        }
+
         let ret = unsafe { libc::kill(pid as libc::pid_t, signal.unix_num()) };
         if ret == 0 {
             return Ok(());
@@ -136,6 +150,39 @@ impl SignalSender for OsSignals {
                 "could not terminate PID {pid}: {}",
                 std::io::Error::last_os_error()
             )))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// PID 0 and any PID that wraps to a negative `pid_t` (e.g. u32::MAX -> -1)
+    /// would make `libc::kill` broadcast to a process group or every process.
+    /// These must be rejected up front — `Internal` error, no signal delivered,
+    /// no panic.
+    #[test]
+    fn invalid_pids_are_rejected_before_kill() {
+        let subject = OsSignals;
+        for bad_pid in [0u32, u32::MAX] {
+            let result = subject.send(bad_pid, Signal::Terminate);
+            let err = match result {
+                Ok(()) => panic!("expected PID {bad_pid} to be rejected"),
+                Err(e) => e,
+            };
+            assert!(
+                matches!(err, AppError::Internal { .. }),
+                "PID {bad_pid} should produce AppError::Internal, got: {err:?}"
+            );
+            assert!(
+                err.to_string().contains("invalid PID"),
+                "message should explain the guard: {err}"
+            );
         }
     }
 }
