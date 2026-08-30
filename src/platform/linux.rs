@@ -17,15 +17,22 @@
 //!
 //! ## IO / parsing separation
 //!
-//! * **IO** (`read_proc_net_*`, `pids_with_inode`, `read_enrichment_*`) touches
+//! * **IO** (`tcp_inodes_for_port`, `pids_holding_any_inode`, `enrich`) touches
 //!   the filesystem only.
 //! * **Parsing** (`parse_proc_net_tcp`, `parse_status_name`, `parse_cmdline`)
 //!   are pure functions over `&str`/`&[u8]`, exhaustively unit-tested against
 //!   mock `/proc` output.
+//!
+//! ## Performance: one `/proc` pass, not four million
+//!
+//! Process discovery must never blindly iterate `1..=pid_max` (often 4,194,304),
+//! which costs millions of `read_dir` syscalls. Instead we read `/proc` **once**,
+//! keep only the numeric directories (active PIDs), and match every process's
+//! `/fd` links against the small `HashSet` of target socket inodes in a single
+//! pass over the active set.
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
 
 use crate::error::AppError;
 use crate::process::ProcessInfo;
@@ -144,13 +151,13 @@ pub fn parse_cmdline(cmdline: &[u8]) -> String {
 const PORT_IN_KERNEL: u8 = 0x0A; // TCP_LISTEN
 
 /// Read both `/proc/net/tcp` and `/proc/net/tcp6` and collect the LISTEN-ing
-/// socket inodes bound to `port`. Returns an empty vec when nothing is bound.
+/// socket inodes bound to `port`. Returns an empty set when nothing is bound.
 ///
 /// v1.0 inspects TCP only. UDP shares the same `/proc/net/udp` shape, but its
 /// state nibble differs and it is deliberately out of scope for now.
-fn tcp_inodes_for_port(port: u16) -> Result<Vec<u64>, AppError> {
+fn tcp_inodes_for_port(port: u16) -> Result<HashSet<u64>, AppError> {
     const PROC_TABLES: &[&str] = &["/proc/net/tcp", "/proc/net/tcp6"];
-    let mut inodes = Vec::new();
+    let mut inodes = HashSet::new();
     for table in PROC_TABLES {
         // A missing table (e.g. an old kernel without IPv6) is not fatal —
         // read what exists; only a hard IO failure propagates.
@@ -169,35 +176,71 @@ fn tcp_inodes_for_port(port: u16) -> Result<Vec<u64>, AppError> {
     Ok(inodes)
 }
 
-/// Collect every PID whose open fd set includes the given socket inode.
-/// Returns an empty set when no process holds that socket (e.g. it vanished).
-fn pids_holding_inode(inode: u64, max_pid: u32) -> HashSet<u32> {
+/// Is `name` a well-formed PID directory (all ASCII digits, non-empty)?
+///
+/// `/proc` also contains non-process entries (`cpu`, `net`, `self`, ...) that
+/// must be skipped; a purely numeric name is the reliable marker for a PID.
+fn is_pid_dir(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Scan `/proc` **once** and return every PID whose open control-flow
+/// descriptor set contains any of the target socket inodes.
+///
+/// Only active processes are visited: we read `/proc` a single time, filter to
+/// numeric (PID) directories, then read each process's `/fd` subdirectory and
+/// match each symlink target (`socket:[<inode>]`) against `targets` using a set
+/// lookup. Processes whose `/proc/<pid>/fd` is unreadable (e.g. owned by
+/// another user / root) simply contribute nothing here.
+fn pids_holding_any_inode(targets: &HashSet<u64>) -> HashSet<u32> {
     let mut pids = HashSet::new();
-    for pid in 1..=max_pid {
-        let fd_dir = PathBuf::from(format!("/proc/{pid}/fd"));
-        let Ok(entries) = fs::read_dir(&fd_dir) else {
-            continue; // no such pid, or permission — skip
+    if targets.is_empty() {
+        return pids;
+    }
+
+    // Read the process table exactly once.
+    let Ok(proc_entries) = fs::read_dir("/proc") else {
+        return pids;
+    };
+    for entry in proc_entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
         };
-        for entry in entries.flatten() {
-            let link = match fs::read_link(entry.path()) {
-                Ok(l) => l,
-                Err(_) => continue,
+        if !is_pid_dir(name) {
+            continue; // not a process directory (cpu, net, self, ...)
+        }
+        let Some(pid) = name.parse::<u32>().ok() else {
+            continue;
+        };
+
+        let fd_dir = entry.path().join("fd");
+        let Ok(fd_entries) = fs::read_dir(&fd_dir) else {
+            continue; // unreadable (permission) or vanished — skip
+        };
+        for fd in fd_entries.flatten() {
+            let Ok(link) = fs::read_link(fd.path()) else {
+                continue;
             };
-            let link = link.to_string_lossy();
-            if link == format!("socket:[{inode}]") {
+            let Some(inode) = inode_from_socket_link(&link) else {
+                continue;
+            };
+            if targets.contains(&inode) {
                 pids.insert(pid);
+                break; // one matching descriptor is enough per process
             }
         }
     }
     pids
 }
 
-/// Highest PID on the system, read from `/proc/sys/kernel/pid_max`.
-fn max_pid() -> u32 {
-    fs::read_to_string("/proc/sys/kernel/pid_max")
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(4194304) // safe Linux default upper bound
+/// Parse a `socket:[<inode>]` symlink target into its `u64` inode.
+///
+/// Returns `None` for any non-socket link (files, directories, pipes, ...).
+fn inode_from_socket_link(link: &std::path::Path) -> Option<u64> {
+    let s = link.to_str()?;
+    let inner = s.strip_prefix("socket:[")?.strip_suffix(']')?;
+    inner.parse().ok()
 }
 
 fn enrich(pid: u32) -> ProcessInfo {
@@ -232,24 +275,23 @@ fn enrich(pid: u32) -> ProcessInfo {
 /// "impossibly free port" trap.
 ///
 /// * Empty `inodes` → port is genuinely free → empty PID set.
-/// * Non-empty `inodes` but no resolvable PIDs → the port is verifiably in use
-///   yet unreadable under our privileges; return [`AppError::AccessDenied`].
+/// * Non-empty `inodes` but the scan finds no matching PIDs → the port is
+///   verifiably in use yet unreadable under our privileges; return
+///   [`AppError::AccessDenied`].
 /// * Otherwise → the resolved PID set.
 ///
-/// `holding` yields the PIDs that hold one inode; it is injected so this
-/// decision is unit-testable without a real `/proc`.
+/// `scan` performs the (once-per-process-table) filesystem walk over `/proc`
+/// for the given `inodes`; it is injected so this decision is unit-testable
+/// without a real `/proc`.
 fn pids_or_access_denied(
     port: u16,
-    inodes: &[u64],
-    mut holding: impl FnMut(u64) -> HashSet<u32>,
+    inodes: &HashSet<u64>,
+    mut scan: impl FnMut(&HashSet<u64>) -> HashSet<u32>,
 ) -> Result<HashSet<u32>, AppError> {
     if inodes.is_empty() {
         return Ok(HashSet::new()); // port free
     }
-    let mut pids = HashSet::new();
-    for inode in inodes {
-        pids.extend(holding(*inode));
-    }
+    let pids = scan(inodes);
     if pids.is_empty() {
         // Port is in use but every owning pid was unreadable under our
         // privileges. Crucially *not* an empty result.
@@ -261,8 +303,7 @@ fn pids_or_access_denied(
 /// Look up every process bound to `port` on TCP (LISTEN state).
 pub fn get_processes_on_port(port: u16) -> Result<Vec<ProcessInfo>, AppError> {
     let inodes = tcp_inodes_for_port(port)?;
-    let top = max_pid();
-    let pids = pids_or_access_denied(port, &inodes, |inode| pids_holding_inode(inode, top))?;
+    let pids = pids_or_access_denied(port, &inodes, pids_holding_any_inode)?;
     Ok(pids.into_iter().map(enrich).collect())
 }
 
@@ -360,37 +401,73 @@ mod tests {
     }
 
     #[test]
-    fn max_pid_has_sane_fallback() {
-        // Never panics and always returns a positive bound.
-        assert!(max_pid() > 0);
+    fn is_pid_dir_accepts_numeric_only() {
+        assert!(is_pid_dir("44122"));
+        assert!(is_pid_dir("0"));
+        assert!(!is_pid_dir(""));
+        assert!(!is_pid_dir("cpu"));
+        assert!(!is_pid_dir("net"));
+        assert!(!is_pid_dir("self"));
+        assert!(!is_pid_dir("1a2"));
+        assert!(!is_pid_dir("12.5"));
+    }
+
+    #[test]
+    fn parses_socket_link_inodes() {
+        assert_eq!(
+            inode_from_socket_link(&std::path::PathBuf::from("socket:[12345]")),
+            Some(12345)
+        );
+        assert_eq!(
+            inode_from_socket_link(&std::path::PathBuf::from("socket:[54321]")),
+            Some(54321)
+        );
+        // Non-socket descriptors must be ignored.
+        assert_eq!(
+            inode_from_socket_link(&std::path::PathBuf::from("/usr/lib/libc.dylib")),
+            None
+        );
+        assert_eq!(
+            inode_from_socket_link(&std::path::PathBuf::from("pipe:[777]")),
+            None
+        );
+        assert_eq!(
+            inode_from_socket_link(&std::path::PathBuf::from("anon_inode:[eventpoll]")),
+            None
+        );
     }
 
     #[test]
     fn no_inodes_means_port_is_free() {
-        let pids = pids_or_access_denied(3000, &[], |_| HashSet::new()).unwrap();
+        // Empty inode set => port free, regardless of the scan.
+        let pids = pids_or_access_denied(3000, &HashSet::new(), |_| {
+            panic!("scan must not run for an empty inode set")
+        })
+        .unwrap();
         assert!(pids.is_empty());
     }
 
     #[test]
     fn occupied_port_with_unresolvable_pids_is_access_denied_not_free() {
-        // Matching inodes exist (port is verifiably in use) but no PID can be
-        // resolved — the silent "free port" trap when inspecting root-owned
+        // Matching inodes exist (port is verifiably in use) but the scan finds
+        // no PID — the silent "free port" trap when inspecting root-owned
         // ports. This MUST error, never return an empty list.
-        let err = pids_or_access_denied(80, &[12345, 54321], |_| HashSet::new()).unwrap_err();
+        let targets: HashSet<u64> = [12345, 54321].into_iter().collect();
+        let err = pids_or_access_denied(80, &targets, |_| HashSet::new()).unwrap_err();
         assert!(matches!(err, AppError::AccessDenied { port: 80 }));
     }
 
     #[test]
-    fn resolves_pids_across_all_inodes() {
-        // Multiple inodes (e.g. v4 + v6 sockets for the same port) contribute
-        // PIDs that are unioned together.
-        let pids = pids_or_access_denied(3000, &[100, 200], |inode| match inode {
-            100 => [7, 8].into_iter().collect(),
-            200 => [8, 9].into_iter().collect(),
-            _ => HashSet::new(),
+    fn resolves_pids_when_scan_matches_target_inodes() {
+        // A single /proc scan yields the owning PIDs for the whole inode set.
+        let targets: HashSet<u64> = [100, 200].into_iter().collect();
+        let pids = pids_or_access_denied(3000, &targets, |set| {
+            // Simulate two processes holding the target sockets.
+            HashSet::from([set.len() as u32 * 100 + 7, set.len() as u32 * 100 + 8])
         })
         .unwrap();
-        assert_eq!(pids, [7, 8, 9].into_iter().collect());
+        // The scan returned two PIDs for a non-empty, non-denied port.
+        assert_eq!(pids.len(), 2);
     }
 
     #[test]
