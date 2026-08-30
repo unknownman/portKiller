@@ -143,19 +143,29 @@ pub fn parse_cmdline(cmdline: &[u8]) -> String {
 
 const PORT_IN_KERNEL: u8 = 0x0A; // TCP_LISTEN
 
-/// Read `/proc/net/tcp` and collect the LISTEN-ing socket inodes bound to
-/// `port`. Returns an empty vec when nothing is bound to the port.
+/// Read both `/proc/net/tcp` and `/proc/net/tcp6` and collect the LISTEN-ing
+/// socket inodes bound to `port`. Returns an empty vec when nothing is bound.
 ///
 /// v1.0 inspects TCP only. UDP shares the same `/proc/net/udp` shape, but its
 /// state nibble differs and it is deliberately out of scope for now.
 fn tcp_inodes_for_port(port: u16) -> Result<Vec<u64>, AppError> {
-    const PROC_TCP: &str = "/proc/net/tcp";
-    let contents = fs::read_to_string(PROC_TCP).map_err(|e| AppError::io(PROC_TCP, e))?;
-    let inodes: Vec<u64> = parse_proc_net_tcp(&contents)
-        .into_iter()
-        .filter(|e| e.local_port == port && e.state == PORT_IN_KERNEL)
-        .map(|e| e.inode)
-        .collect();
+    const PROC_TABLES: &[&str] = &["/proc/net/tcp", "/proc/net/tcp6"];
+    let mut inodes = Vec::new();
+    for table in PROC_TABLES {
+        // A missing table (e.g. an old kernel without IPv6) is not fatal —
+        // read what exists; only a hard IO failure propagates.
+        let contents = match fs::read_to_string(table) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(AppError::io(*table, e)),
+        };
+        inodes.extend(
+            parse_proc_net_tcp(&contents)
+                .into_iter()
+                .filter(|e| e.local_port == port && e.state == PORT_IN_KERNEL)
+                .map(|e| e.inode),
+        );
+    }
     Ok(inodes)
 }
 
@@ -218,19 +228,41 @@ fn enrich(pid: u32) -> ProcessInfo {
     }
 }
 
+/// Resolve owning PIDs for a set of inodes, guarding against the silent
+/// "impossibly free port" trap.
+///
+/// * Empty `inodes` → port is genuinely free → empty PID set.
+/// * Non-empty `inodes` but no resolvable PIDs → the port is verifiably in use
+///   yet unreadable under our privileges; return [`AppError::AccessDenied`].
+/// * Otherwise → the resolved PID set.
+///
+/// `holding` yields the PIDs that hold one inode; it is injected so this
+/// decision is unit-testable without a real `/proc`.
+fn pids_or_access_denied(
+    port: u16,
+    inodes: &[u64],
+    mut holding: impl FnMut(u64) -> HashSet<u32>,
+) -> Result<HashSet<u32>, AppError> {
+    if inodes.is_empty() {
+        return Ok(HashSet::new()); // port free
+    }
+    let mut pids = HashSet::new();
+    for inode in inodes {
+        pids.extend(holding(*inode));
+    }
+    if pids.is_empty() {
+        // Port is in use but every owning pid was unreadable under our
+        // privileges. Crucially *not* an empty result.
+        return Err(AppError::AccessDenied { port });
+    }
+    Ok(pids)
+}
+
 /// Look up every process bound to `port` on TCP (LISTEN state).
 pub fn get_processes_on_port(port: u16) -> Result<Vec<ProcessInfo>, AppError> {
     let inodes = tcp_inodes_for_port(port)?;
-    if inodes.is_empty() {
-        return Ok(Vec::new()); // port free
-    }
-
     let top = max_pid();
-    let mut pids = HashSet::new();
-    for inode in inodes {
-        pids.extend(pids_holding_inode(inode, top));
-    }
-
+    let pids = pids_or_access_denied(port, &inodes, |inode| pids_holding_inode(inode, top))?;
     Ok(pids.into_iter().map(enrich).collect())
 }
 
@@ -331,5 +363,49 @@ mod tests {
     fn max_pid_has_sane_fallback() {
         // Never panics and always returns a positive bound.
         assert!(max_pid() > 0);
+    }
+
+    #[test]
+    fn no_inodes_means_port_is_free() {
+        let pids = pids_or_access_denied(3000, &[], |_| HashSet::new()).unwrap();
+        assert!(pids.is_empty());
+    }
+
+    #[test]
+    fn occupied_port_with_unresolvable_pids_is_access_denied_not_free() {
+        // Matching inodes exist (port is verifiably in use) but no PID can be
+        // resolved — the silent "free port" trap when inspecting root-owned
+        // ports. This MUST error, never return an empty list.
+        let err = pids_or_access_denied(80, &[12345, 54321], |_| HashSet::new()).unwrap_err();
+        assert!(matches!(err, AppError::AccessDenied { port: 80 }));
+    }
+
+    #[test]
+    fn resolves_pids_across_all_inodes() {
+        // Multiple inodes (e.g. v4 + v6 sockets for the same port) contribute
+        // PIDs that are unioned together.
+        let pids = pids_or_access_denied(3000, &[100, 200], |inode| match inode {
+            100 => [7, 8].into_iter().collect(),
+            200 => [8, 9].into_iter().collect(),
+            _ => HashSet::new(),
+        })
+        .unwrap();
+        assert_eq!(pids, [7, 8, 9].into_iter().collect());
+    }
+
+    #[test]
+    fn parses_full_ipv6_tcp_listen_row_shape() {
+        // A realistic `/proc/net/tcp6` row: 32-hex v6 local address then :PORT.
+        let tcp6 = r#"  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000000000000000000000000000:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 424242 1 0000000000000000 100 0 0 10 0
+   1: 00000000000000000000000000000000:0BB8 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 777777 1 0000000000000000 100 0 0 10 0
+"#;
+        let entries = parse_proc_net_tcp(tcp6);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].local_port, 8080);
+        assert_eq!(entries[0].state, 0x0A);
+        assert_eq!(entries[0].inode, 424242);
+        assert_eq!(entries[1].local_port, 3000);
+        assert_eq!(entries[1].inode, 777777);
     }
 }

@@ -188,6 +188,10 @@ pub enum RunMode {
     DryRun,
     /// `--kill`/`--force` executed; rows carry their outcome in the STATUS column.
     Kill,
+    /// Confirmation prompt shown to the user just before killing — like
+    /// [`RunMode::Inspect`] but without the "inspect only" verdict footer,
+    /// since they are already in the kill flow.
+    Confirming,
     /// The user declined the confirmation prompt.
     Aborted,
 }
@@ -279,5 +283,6 @@ mod tests {
         assert!(TableOptions::new(RunMode::DryRun).show_status());
         assert!(TableOptions::new(RunMode::Kill).show_status());
         assert!(!TableOptions::new(RunMode::Aborted).show_status());
+        assert!(!TableOptions::new(RunMode::Confirming).show_status());
     }
 }

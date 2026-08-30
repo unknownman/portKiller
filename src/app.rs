@@ -79,19 +79,30 @@ pub fn run(runner: &Runner, cli: &Cli, mut confirm: impl FnMut() -> bool) -> i32
         return exit::OK;
     }
 
-    // 5. Confirm graceful kills (--force/-y skips the prompt).
-    if kill_intent && !cli.force && !confirm() {
-        emit_mode(&results, cli.json, RunMode::Aborted);
-        return exit::OK;
-    }
-
+    // 5. Read-only mode: the rendered table is the whole story.
     if !kill_intent {
-        // Read-only mode: the rendered table is the whole story.
         emit_mode(&results, cli.json, RunMode::Inspect);
         return exit::OK;
     }
 
-    // 6. Execute & verify, recording every outcome onto its row.
+    // 6. Graceful kill needs confirmation. --force/-y skips the prompt, but
+    //    still shows the affected processes in the pre-kill table below.
+    if !cli.force {
+        // Show the user exactly what is about to be killed *before* asking,
+        // so the confirmation is never blind. Confirming mode prints the
+        // standard table without the "inspect only" verdict footer. This
+        // intermediate human step must never pollute JSON output, so it only
+        // runs for the human view.
+        if !cli.json {
+            emit_mode(&results, cli.json, RunMode::Confirming);
+        }
+        if !confirm() {
+            emit_mode(&results, cli.json, RunMode::Aborted);
+            return exit::OK;
+        }
+    }
+
+    // 7. Execute & verify, recording every outcome onto its row.
     let mut any_failed = false;
     for port_result in results.iter_mut().filter(|r| r.is_occupied()) {
         let port = port_result.port;

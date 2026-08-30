@@ -51,7 +51,7 @@ pub fn render_table(results: &[PortResult], opts: &TableOptions) -> String {
                     .yellow()
                     .to_string(),
             ),
-            RunMode::Inspect | RunMode::Kill => {}
+            RunMode::Inspect | RunMode::Kill | RunMode::Confirming => {}
         }
     }
 
@@ -114,6 +114,9 @@ fn port_verdict(port: &PortResult, opts: &TableOptions) -> String {
             }
         }
         RunMode::Aborted => String::new(),
+        // Already in the kill flow: print the table as-is, but skip the
+        // "inspect only — run `pk --kill`" hint that would be confusing.
+        RunMode::Confirming => String::new(),
     }
 }
 
@@ -424,6 +427,25 @@ mod tests {
         let result = occupied(3000, vec![bare(5, "node")]);
         let out = render_table(&[result], &TableOptions::new(RunMode::Aborted));
         assert!(out.contains("Aborted — no processes were terminated."));
+        assert!(!out.contains("STATUS"));
+    }
+
+    #[test]
+    fn confirming_mode_shows_table_but_omits_inspect_footer() {
+        no_color();
+        let result = occupied(3000, vec![rich(44122, "node", "node server.js")]);
+        let out = render_table(&[result], &TableOptions::new(RunMode::Confirming));
+        assert!(out.contains("Port 3000 — in use"));
+        assert!(out.contains("44122"));
+        assert!(out.contains("node server.js"));
+        assert!(
+            !out.contains("inspect only"),
+            "must not show the inspect-only verdict during confirmation:\n{out}"
+        );
+        assert!(
+            !out.contains("pk --kill 3000"),
+            "must not suggest the kill command during confirmation:\n{out}"
+        );
         assert!(!out.contains("STATUS"));
     }
 }

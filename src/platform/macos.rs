@@ -88,8 +88,7 @@ pub fn parse_lsof_listen(output: &str, port: u16) -> Vec<LsofRow> {
 /// so we normalise exit code 1 to empty output.
 fn run_lsof(port: u16) -> Result<String, AppError> {
     let output = Command::new(LSOF)
-        .args(["-n", "-P", "-iTCP", "-sTCP:LISTEN"])
-        .arg(format!("-iTCP:{port}"))
+        .args(["-n", "-P", format!("-iTCP:{port}").as_str(), "-sTCP:LISTEN"])
         .output()
         .map_err(|e| AppError::OsCommandFailed {
             command: LSOF,
