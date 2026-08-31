@@ -39,7 +39,7 @@ impl ProcessEnricher {
     pub fn new() -> Self {
         Self {
             system: System::new(),
-            users: Users::new(),
+            users: Users::new_with_refreshed_list(),
         }
     }
 
