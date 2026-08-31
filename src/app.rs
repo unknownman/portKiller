@@ -22,6 +22,7 @@ use crate::error::AppError;
 use crate::kill::signal::SignalSender;
 use crate::kill::{KillConfig, KillOutcome, terminate_one};
 use crate::platform::PlatformProvider;
+use crate::process::ProcessInfo;
 use crate::process::Protocol;
 use crate::process::enrich::ProcessEnricher;
 use crate::render::{
@@ -152,22 +153,45 @@ pub fn run(runner: &Runner, cli: &Cli, mut confirm: impl FnMut() -> bool) -> i32
 /// that the OS refuses to inspect becomes an error-carrying view, never a
 /// fatal panic.
 ///
-/// A single [`ProcessEnricher`] is created up front and shared across every
-/// discovered process, so the expensive `sysinfo` snapshot is taken once per
-/// inspection batch rather than once per process.
+/// This uses a lazy two-pass strategy: port discovery is cheap, so pass 1
+/// inspects every port *without* touching `sysinfo`. Only if at least one port
+/// is occupied does pass 2 build a single [`ProcessEnricher`] (one `sysinfo`
+/// snapshot shared across the whole batch). A fully free / error-only run never
+/// pays for the heavy OS scan at all. Input port order is preserved.
 fn inspect_ports(provider: &dyn PlatformProvider, ports: &[u16]) -> Vec<PortResult> {
-    let mut enricher = ProcessEnricher::new();
     let mut results = Vec::with_capacity(ports.len());
-    for &port in ports {
+    // Occupied ports are remembered by their index in `results`, plus their raw
+    // (unenriched) processes, so pass 2 can enrich exactly those in place.
+    let mut occupied: Vec<(usize, u16, Vec<ProcessInfo>)> = Vec::new();
+
+    // Pass 1: raw inspection. No sysinfo work happens here.
+    for (idx, &port) in ports.iter().enumerate() {
         match provider.get_processes_on_port(port) {
             Ok(procs) if procs.is_empty() => results.push(PortResult::free(port)),
-            Ok(procs) => results.push(PortResult::occupied(port, enricher.enrich_all(procs))),
+            Ok(procs) => {
+                // Placeholder to preserve ordering; filled in with enriched data
+                // only if pass 2 runs.
+                results.push(PortResult::occupied(port, Vec::new()));
+                occupied.push((idx, port, procs));
+            }
             Err(e) => results.push(PortResult::inspection_error(
                 port,
                 Protocol::Tcp,
                 e.to_string(),
             )),
         }
+    }
+
+    // Nothing is bound — there is nothing to enrich, so never build sysinfo.
+    if occupied.is_empty() {
+        return results;
+    }
+
+    // Pass 2: only now take the (single) sysinfo snapshot and enrich the raw
+    // processes of every occupied port, writing each back to its slot.
+    let mut enricher = ProcessEnricher::new();
+    for (idx, port, procs) in occupied {
+        results[idx] = PortResult::occupied(port, enricher.enrich_all(procs));
     }
     results
 }
