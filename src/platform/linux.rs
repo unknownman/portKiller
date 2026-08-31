@@ -141,7 +141,10 @@ pub fn parse_cmdline(cmdline: &[u8]) -> String {
         return String::new();
     }
     let trimmed = cmdline.strip_suffix(b"\0").unwrap_or(cmdline);
-    String::from_utf8_lossy(trimmed).replace('\0', " ")
+    String::from_utf8_lossy(trimmed)
+        .replace('\0', " ")
+        .trim()
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -398,6 +401,7 @@ mod tests {
 
         assert_eq!(parse_cmdline(b""), "");
         assert_eq!(parse_cmdline(b"node\0"), "node");
+        assert_eq!(parse_cmdline(b"node\0\0\0"), "node");
     }
 
     #[test]
