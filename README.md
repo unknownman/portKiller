@@ -6,7 +6,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/portkill-cli.svg)](https://crates.io/crates/portkill-cli)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Build Status](https://img.shields.io/github/actions/workflow/status/alijoder/portkill/release.yml?branch=main)](https://github.com/alijoder/portkill/actions)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/unknownman/portKiller/release.yml?branch=main)](https://github.com/unknownman/portKiller/actions)
 
 ## Demo
 
