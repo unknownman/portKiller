@@ -92,12 +92,23 @@ pub fn run(runner: &Runner, cli: &Cli, mut confirm: impl FnMut() -> bool) -> i32
     if cli.dry_run {
         stamp_dry_run(&mut results, cli.force);
         emit_mode(&results, cli.json, RunMode::DryRun);
+        // A port that failed to inspect is a partial failure — surface it as a
+        // non-zero exit so CI doesn't mistake a broken inspection for success.
+        if results.iter().any(|r| r.is_error()) {
+            return exit::USAGE_OR_INTERNAL;
+        }
         return exit::OK;
     }
 
     // 5. Read-only mode: the rendered table is the whole story.
     if !kill_intent {
         emit_mode(&results, cli.json, RunMode::Inspect);
+        // Any port that failed to inspect (e.g. AccessDenied on `80`) while
+        // others succeeded is a partial failure — non-zero so scripts can't
+        // assume the whole inspection was clean.
+        if results.iter().any(|r| r.is_error()) {
+            return exit::USAGE_OR_INTERNAL;
+        }
         return exit::OK;
     }
 
@@ -339,6 +350,63 @@ mod tests {
             || false,
         );
         assert_eq!(code, exit::NOTHING_FOUND);
+    }
+
+    /// Provider that fails inspection for `fail_port` (e.g. a privileged port
+    /// another user owns) and is free everywhere else — a *partial* failure
+    /// across a multi-port run.
+    struct FailingInspectProvider {
+        fail_port: u16,
+    }
+    impl PlatformProvider for FailingInspectProvider {
+        fn get_processes_on_port(&self, port: u16) -> Result<Vec<ProcessInfo>, AppError> {
+            if port == self.fail_port {
+                Err(AppError::AccessDenied { port })
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        fn is_port_free(&self, _port: u16) -> Result<bool, AppError> {
+            Ok(true)
+        }
+        fn is_process_gone_from_port(
+            &self,
+            _port: u16,
+            _target_pid: u32,
+        ) -> Result<bool, AppError> {
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn partial_inspection_failure_read_only_exits_3() {
+        // `80` fails to inspect (AccessDenied) while `3000` is free; the whole
+        // inspection is only partially successful, so the exit code must be 3,
+        // not 0 — CI must not mistake a broken inspection for a clean pass.
+        let provider = FailingInspectProvider { fail_port: 80 };
+        let signals = Recorder {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let code = run(
+            &runner(&provider, &signals),
+            &cli(&["80", "3000"], false, false, false),
+            || false,
+        );
+        assert_eq!(code, exit::USAGE_OR_INTERNAL);
+    }
+
+    #[test]
+    fn partial_inspection_failure_dry_run_exits_3() {
+        let provider = FailingInspectProvider { fail_port: 80 };
+        let signals = Recorder {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let code = run(
+            &runner(&provider, &signals),
+            &cli(&["80", "3000"], false, false, true),
+            || false,
+        );
+        assert_eq!(code, exit::USAGE_OR_INTERNAL);
     }
 
     #[test]

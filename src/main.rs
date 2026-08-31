@@ -27,6 +27,11 @@ use kill::KillConfig;
 use kill::signal::OsSignals;
 
 fn main() {
+    // Enable ANSI rendering on Windows `cmd.exe`/conhost, which does not opt in
+    // to virtual terminal processing by default. (`set_virtual_terminal` is a
+    // Windows-only API.)
+    #[cfg(windows)]
+    let _ = colored::control::set_virtual_terminal(true);
     let cli = Cli::parse();
     let exit_code = real_run(&cli);
     std::process::exit(exit_code);

@@ -39,7 +39,10 @@ pub struct Cli {
     ///
     /// Sends SIGTERM, waits briefly, verifies the port is actually released,
     /// and escalates to SIGKILL only if the process fails to exit on its own.
-    #[arg(short, long, conflicts_with = "force")]
+    ///
+    /// Its conflict resolution is left to `--force`'s `overrides_with = "kill"`,
+    /// so `pk -k -f 3000` lets `--force` (SIGKILL) win rather than erroring.
+    #[arg(short, long)]
     pub kill: bool,
 
     /// Forcefully terminate immediately, skipping graceful shutdown.
