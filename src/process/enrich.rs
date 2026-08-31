@@ -9,42 +9,44 @@
 //! metadata the platform already supplied, and it never fails the caller — if
 //! `sysinfo` cannot resolve a field, the process keeps whatever it had.
 //!
-//! # Performance: one `sysinfo::System` per batch
+//! # Performance: one scoped `sysinfo::System` per batch
 //!
 //! Building a [`sysinfo::System`] and refreshing the process table is expensive.
 //! Constructing it *per process* — as inspection of a port range with many
-//! processes would do — causes redundant heavy system scanning. Instead we
-//! create a single [`ProcessEnricher`] per inspection batch and reuse its
-//! `system` (and its user list) for every discovered process.
+//! processes would do — causes redundant heavy system scanning. The [`System`]
+//! here is created once per inspection batch (lazily), and [`ProcessEnricher::enrich_all`]
+//! refreshes **only the exact PIDs we discovered**, so a handful of targets never
+//! scans the whole process table. The single user list is shared across the batch.
 
 use crate::process::ProcessInfo;
-use sysinfo::{Pid, ProcessRefreshKind, System, UpdateKind, Users};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind, Users};
 
 /// Reusable, batch-aware enricher backed by one shared [`sysinfo::System`].
 ///
-/// Create one `ProcessEnricher` per inspection and call [`ProcessEnricher::enrich`]
-/// (or [`ProcessEnricher::enrich_all`]) for every discovered process. The system
-/// snapshot and user list are refreshed exactly once, in [`ProcessEnricher::new`],
-/// eliminating the per-process instantiation overhead.
+/// Create one `ProcessEnricher` per inspection and call [`ProcessEnricher::enrich_all`]
+/// for every discovered process. The system snapshot is populated lazily, on the
+/// first call, and only for the PIDs actually requested.
 pub struct ProcessEnricher {
     system: System,
     users: Users,
 }
 
 impl ProcessEnricher {
-    /// Build an enricher, refreshing the process table (with only the metadata
-    /// we need) and the user list exactly once.
+    /// Build an enricher with an empty (unrefreshed) system and user list.
+    ///
+    /// No OS scanning happens here; the process table is refreshed — scoped to
+    /// the exact PIDs — by [`ProcessEnricher::enrich_all`].
     pub fn new() -> Self {
-        let mut system = System::new();
-        system.refresh_processes_specifics(Self::refresh_kind());
-        let users = Users::new_with_refreshed_list();
-        Self { system, users }
+        Self {
+            system: System::new(),
+            users: Users::new(),
+        }
     }
 
     /// The process metadata to collect. Avoids CPU/memory work that is
     /// irrelevant to port inspection.
     fn refresh_kind() -> ProcessRefreshKind {
-        ProcessRefreshKind::new()
+        ProcessRefreshKind::nothing()
             .with_cmd(UpdateKind::OnlyIfNotSet)
             .with_user(UpdateKind::OnlyIfNotSet)
             .with_cwd(UpdateKind::OnlyIfNotSet)
@@ -61,6 +63,9 @@ impl ProcessEnricher {
     /// name from the same snapshot it already took for command/user/cwd, so we
     /// use it to overwrite that placeholder (or an empty name) at no extra cost.
     ///
+    /// Callers must have populated the snapshot first (via [`ProcessEnricher::enrich_all`]);
+    /// a PID that is not in the snapshot is left untouched.
+    ///
     /// Returns the (possibly unchanged) process. This is deliberately not
     /// `Result`: a best-effort enrichment failure should not abort an inspection.
     pub fn enrich(&mut self, mut process: ProcessInfo) -> ProcessInfo {
@@ -72,14 +77,19 @@ impl ProcessEnricher {
         };
 
         if process.name.starts_with("pid-") || process.name.is_empty() {
-            let real_name = sysinfo_proc.name().to_string();
+            let real_name = sysinfo_proc.name().to_string_lossy().into_owned();
             if !real_name.is_empty() {
                 process.name = real_name;
             }
         }
 
         if process.command.is_none() {
-            let cmd = sysinfo_proc.cmd().join(" ").trim().to_string();
+            let args: Vec<String> = sysinfo_proc
+                .cmd()
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            let cmd = args.join(" ").trim().to_string();
             if !cmd.is_empty() {
                 process.command = Some(cmd);
             }
@@ -99,7 +109,17 @@ impl ProcessEnricher {
     }
 
     /// Enrich a whole batch of processes against the shared snapshot.
+    ///
+    /// Before looping, it refreshes the system snapshot **only** for the PIDs in
+    /// the batch — the OS fetches metadata for exactly the processes we care
+    /// about, never the entire table.
     pub fn enrich_all(&mut self, processes: Vec<ProcessInfo>) -> Vec<ProcessInfo> {
+        let pids: Vec<Pid> = processes.iter().map(|p| Pid::from_u32(p.pid)).collect();
+        self.system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&pids),
+            true,
+            Self::refresh_kind(),
+        );
         processes.into_iter().map(|p| self.enrich(p)).collect()
     }
 }
@@ -121,14 +141,15 @@ mod tests {
         // the real executable name from sysinfo.
         let pid = std::process::id();
         let mut enricher = ProcessEnricher::new();
-        let enriched = enricher.enrich(ProcessInfo::bare(pid, format!("pid-{pid}")));
+        let enriched = enricher.enrich_all(vec![ProcessInfo::bare(pid, format!("pid-{pid}"))]);
 
+        let name = &enriched[0].name;
         assert!(
-            !enriched.name.is_empty(),
+            !name.is_empty(),
             "placeholder name must be replaced with the real process name"
         );
         assert!(
-            !enriched.name.starts_with("pid-"),
+            !name.starts_with("pid-"),
             "name must no longer be a synthetic pid- placeholder"
         );
     }
