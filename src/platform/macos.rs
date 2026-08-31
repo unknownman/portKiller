@@ -1,4 +1,4 @@
-//! macOS port → process discovery (via `lsof`).
+//! macOS port → process discovery (via `lsof` + `netstat`).
 //!
 //! ## Approach: shell out to `lsof`
 //!
@@ -11,11 +11,25 @@
 //! `-n` and `-P` disable hostname/port name resolution for speed and
 //! machine-friendly output. Each row names the owning process.
 //!
+//! ## Hidden-owner escape hatch: `netstat`
+//!
+//! `lsof` only reports processes **we** are permitted to see. When a privileged
+//! daemon (e.g. `root`) owns the port, `lsof` silently exits `1` with no output,
+//! which naively looks like "port free". That would violate our
+//! *trust-through-verification* principle — we must never tell a user a port is
+//! free when it is merely *hidden* from us.
+//!
+//! `netstat -an -p tcp` lists **every** bound port regardless of owning user, so
+//! it is the cross-check: if `lsof` shows nothing but `netstat` reports the port
+//! as `LISTEN`, the port is occupied yet unidentifiable → we return
+//! [`AppError::AccessDenied`]. Only when `netstat` agrees it is unbound do we
+//! report it free.
+//!
 //! ## IO / parsing separation
 //!
-//! * **IO** (`run_lsof`) invokes the binary and captures stdout.
-//! * **Parsing** (`parse_lsof_listen`) consumes the raw text into rows and is
-//!   exhaustively unit-tested against mock `lsof` output.
+//! * **IO** (`run_lsof`, `run_netstat`) invoke the binaries and capture stdout.
+//! * **Parsing** (`parse_lsof_listen`, `parse_mac_netstat_listening`) consume
+//!   the raw text and are exhaustively unit-tested against mock output.
 
 use std::process::Command;
 
@@ -23,6 +37,8 @@ use crate::error::AppError;
 use crate::process::ProcessInfo;
 
 const LSOF: &str = "lsof";
+
+const NETSTAT: &str = "netstat";
 
 /// One parsed `lsof` row that is a LISTENing socket on the target port.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,16 +125,101 @@ fn run_lsof(port: u16) -> Result<String, AppError> {
 }
 
 /// Return the processes bound to `port` (TCP, LISTEN). Empty vec when free.
+///
+/// When `lsof` finds nothing we cross-check with `netstat`: a port that is
+/// occupied but invisible to us (a privileged owner) must surface as
+/// [`AppError::AccessDenied`], not as "free".
 pub fn get_processes_on_port(port: u16) -> Result<Vec<ProcessInfo>, AppError> {
     let raw = run_lsof(port)?;
     let rows = parse_lsof_listen(&raw, port);
+    if rows.is_empty() {
+        ensure_not_hidden(port)?;
+    }
     Ok(rows.into_iter().map(process_from_row).collect())
 }
 
 /// Report whether nothing is bound to `port` (TCP, LISTEN).
+///
+/// As with [`get_processes_on_port`], a port that is merely hidden (found by
+/// `netstat` but invisible to `lsof`) is reported as [`AppError::AccessDenied`]
+/// rather than free.
 pub fn is_port_free(port: u16) -> Result<bool, AppError> {
     let raw = run_lsof(port)?;
-    Ok(parse_lsof_listen(&raw, port).is_empty())
+    if !parse_lsof_listen(&raw, port).is_empty() {
+        return Ok(false);
+    }
+    ensure_not_hidden(port)?;
+    Ok(true)
+}
+
+/// Verify a port that `lsof` reported empty is not merely hidden from us.
+///
+/// `lsof` sees only the processes our user can inspect; `netstat` lists every
+/// bound port regardless of owner. If `netstat` shows the port as `LISTEN`
+/// while `lsof` saw nothing, a process we cannot see holds it — claiming it
+/// free would be a lie, so we escalate to `AccessDenied`.
+fn ensure_not_hidden(port: u16) -> Result<(), AppError> {
+    let netstat = run_netstat()?;
+    if parse_mac_netstat_listening(&netstat, port) {
+        return Err(AppError::AccessDenied { port });
+    }
+    Ok(())
+}
+
+/// Run `netstat` and return its raw stdout.
+///
+/// `netstat -an -p tcp` reveals all listening ports system-wide and needs no
+/// privileges, which is exactly what makes it the right cross-check when `lsof`
+/// (user-scoped) comes up empty.
+fn run_netstat() -> Result<String, AppError> {
+    let output = Command::new(NETSTAT)
+        .args(["-an", "-p", "tcp"])
+        .output()
+        .map_err(|e| AppError::OsCommandFailed {
+            command: NETSTAT,
+            message: format!("could not spawn `{NETSTAT}`: {e}"),
+        })?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(AppError::OsCommandFailed {
+            command: NETSTAT,
+            message: stderr.trim().to_string(),
+        })
+    }
+}
+
+/// Return whether `netstat` output reports `port` as a bound `LISTEN` socket.
+///
+/// Parses `netstat -an -p tcp` output. A row counts when its protocol is `tcp*`,
+/// its state is `LISTEN`, and its `Local Address` ends with `.<port>` (e.g.
+/// `*.80`, `127.0.0.1.80`, `[::1].80`). Any other row — established sockets,
+/// TIME_WAIT, non-tcp protocols, or a different port — is ignored.
+pub fn parse_mac_netstat_listening(output: &str, port: u16) -> bool {
+    let suffix = format!(".{port}");
+    output.lines().any(|line| {
+        let mut tokens = line.split_whitespace();
+        let Some(proto) = tokens.next() else {
+            return false;
+        };
+        if !proto.starts_with("tcp") {
+            return false;
+        }
+        // Remaining fields, in order: Recv-Q Send-Q Local-Address Foreign-Address State
+        let mut fields: Vec<&str> = tokens.collect();
+        let Some(state) = fields.pop() else {
+            return false;
+        };
+        if state != "LISTEN" {
+            return false;
+        }
+        if fields.len() < 3 {
+            return false;
+        }
+        fields[2].ends_with(&suffix)
+    })
 }
 
 /// Convert one lsof row into a `ProcessInfo`.
@@ -227,5 +328,82 @@ real       600 alijoder    5u  IPv6  99995      0t0  TCP [::1]:3000             
             3000,
         );
         assert!(out.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // parse_mac_netstat_listening
+    // ------------------------------------------------------------------
+
+    // Realistic macOS `netstat -an -p tcp` output with one privileged hijacked
+    // port (80) plus other unrelated sockets.
+    const MOCK_NETSTAT: &str = r#"Active Internet connections (including servers)
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)
+tcp4       0      0  127.0.0.1.80           *.*                    LISTEN
+tcp4       0      0  127.0.0.1.3000         *.*                    LISTEN
+tcp6       0      0  ::1.80                *.*                    LISTEN
+tcp4       0      0  10.0.0.5.53338        10.0.0.1.443            ESTABLISHED
+tcp4       0      0  *.22                  *.*                    LISTEN
+"#;
+
+    #[test]
+    fn netstat_detects_ipv4_listen_on_target_port() {
+        assert!(parse_mac_netstat_listening(MOCK_NETSTAT, 80));
+        assert!(parse_mac_netstat_listening(MOCK_NETSTAT, 3000));
+    }
+
+    #[test]
+    fn netstat_detects_ipv6_listen_on_target_port() {
+        assert!(parse_mac_netstat_listening(MOCK_NETSTAT, 80));
+    }
+
+    #[test]
+    fn netstat_detects_wildcard_listener() {
+        assert!(parse_mac_netstat_listening(MOCK_NETSTAT, 22));
+    }
+
+    #[test]
+    fn netstat_ignores_unrelated_ports() {
+        assert!(!parse_mac_netstat_listening(MOCK_NETSTAT, 8080));
+        assert!(!parse_mac_netstat_listening(MOCK_NETSTAT, 443));
+    }
+
+    #[test]
+    fn netstat_ignores_established_and_non_listen_rows() {
+        // Port 443 is only an *outbound* established connection here — it must
+        // not count as bound, and the foreign address `.443` must not be
+        // confused with a local listener.
+        assert!(!parse_mac_netstat_listening(MOCK_NETSTAT, 443));
+        assert!(!parse_mac_netstat_listening(MOCK_NETSTAT, 53338));
+    }
+
+    #[test]
+    fn netstat_empty_or_header_only_is_free() {
+        assert!(!parse_mac_netstat_listening("", 80));
+        assert!(!parse_mac_netstat_listening(
+            "Active Internet connections (including servers)\nProto Recv-Q Send-Q Local Address Foreign Address (state)\n",
+            80,
+        ));
+    }
+
+    #[test]
+    fn netstat_port_suffix_must_match_exactly() {
+        // `.80` must not match `.8001` or `.180`; the port is a whole suffix.
+        let out = "tcp4 0 0 127.0.0.1.8001 *.* LISTEN\ntcp4 0 0 127.0.0.1.180 *.* LISTEN\n";
+        assert!(!parse_mac_netstat_listening(out, 80));
+    }
+
+    #[test]
+    fn netstat_non_tcp_protocol_rows_are_ignored() {
+        let out = "tcp4 0 0 127.0.0.1.80 *.* LISTEN\nudp4 0 0 127.0.0.1.80 *.*\n";
+        assert!(parse_mac_netstat_listening(out, 80));
+    }
+
+    #[test]
+    fn lsof_empty_but_netstat_occupied_is_access_denied() {
+        // A `root`-owned port: lsof sees nothing, netstat proves it is bound.
+        // This is the exact misreport the fix prevents.
+        let raw_lsof = "COMMAND PID USER FD DEVICE SIZE/OFF NODE NAME\n";
+        assert!(parse_lsof_listen(raw_lsof, 80).is_empty());
+        assert!(parse_mac_netstat_listening(MOCK_NETSTAT, 80));
     }
 }
