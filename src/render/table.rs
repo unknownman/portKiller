@@ -20,8 +20,8 @@ use colored::Colorize;
 
 use super::types::{PortResult, ProcessResult, ProcessStatus, RunMode, SignalKind, TableOptions};
 
-/// Longest acceptable DETAILS cell before the value is elided with `…`.
-const DETAILS_MAX_WIDTH: usize = 64;
+/// Longest acceptable COMMAND cell before the value is elided with `…`.
+const COMMAND_MAX_WIDTH: usize = 64;
 
 /// Render the full human-facing document: free-port confirmations, one table
 /// per occupied port (grouping every process sharing that port), warning lines
@@ -130,8 +130,9 @@ fn header_cells(opts: &TableOptions) -> Vec<Cell> {
         header_cell("PORT", Color::Cyan).set_alignment(CellAlignment::Right),
         header_cell("PID", Color::Yellow).set_alignment(CellAlignment::Right),
         header_cell("PROCESS", Color::Green),
+        header_cell("COMMAND", Color::White),
         header_cell("USER", Color::Grey),
-        header_cell("DETAILS", Color::Grey),
+        header_cell("UPTIME", Color::Grey),
     ];
     if opts.show_status() {
         cells.push(header_cell("STATUS", Color::White));
@@ -152,8 +153,9 @@ fn row_cells(port: &PortResult, process: &ProcessResult, show_status: bool) -> V
             .fg(Color::Yellow)
             .set_alignment(CellAlignment::Right),
         Cell::new(sanitize(&process.name)).fg(Color::Green),
+        Cell::new(command_text(process)).fg(Color::White),
         Cell::new(user_text(process)).fg(Color::Grey),
-        Cell::new(details_text(process)).fg(Color::White),
+        Cell::new(uptime_text(process)).fg(Color::Grey),
     ];
     if show_status {
         cells.push(status_cell(process));
@@ -185,25 +187,22 @@ fn status_cell(process: &ProcessResult) -> Cell {
 }
 
 fn user_text(process: &ProcessResult) -> String {
-    process
-        .user
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string())
+    process.user.clone().unwrap_or_else(|| "—".to_string())
 }
 
-/// DETAILS prefers a full command line, falls back to uptime, then CWD — and
-/// always stays a single truncated line so the table never wraps.
-fn details_text(process: &ProcessResult) -> String {
-    if let Some(command) = &process.command {
-        return truncate(&sanitize(command), DETAILS_MAX_WIDTH);
-    }
-    if let Some(secs) = process.uptime_secs {
-        return format!("up {}", human_duration(secs));
-    }
-    if let Some(cwd) = &process.cwd {
-        return truncate(&sanitize(cwd), DETAILS_MAX_WIDTH);
-    }
-    "—".to_string()
+fn command_text(process: &ProcessResult) -> String {
+    process
+        .command
+        .as_ref()
+        .map(|cmd| truncate(&sanitize(cmd), COMMAND_MAX_WIDTH))
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn uptime_text(process: &ProcessResult) -> String {
+    process
+        .uptime_secs
+        .map(human_duration)
+        .unwrap_or_else(|| "—".to_string())
 }
 
 /// Human-friendly uptime in the README's `1h 2m 13s` shape.
@@ -294,7 +293,7 @@ mod tests {
             &[occupied(3000, vec![rich(44122, "node", "node server.js")])],
             &TableOptions::default(),
         );
-        for header in ["PORT", "PID", "PROCESS", "USER", "DETAILS"] {
+        for header in ["PORT", "PID", "PROCESS", "COMMAND", "USER", "UPTIME"] {
             assert!(out.contains(header), "missing header {header}:\n{out}");
         }
         assert!(
@@ -304,6 +303,7 @@ mod tests {
         assert!(out.contains("44122"));
         assert!(out.contains("node server.js"));
         assert!(out.contains("alijoder"));
+        assert!(out.contains("1h 2m 4s"));
         assert!(out.contains("Port 3000 — in use"));
         assert!(
             out.contains("pk --kill 3000"),
@@ -387,18 +387,21 @@ mod tests {
     }
 
     #[test]
-    fn missing_command_falls_back_to_uptime_then_cwd() {
+    fn missing_command_and_uptime_render_placeholders() {
         no_color();
         let out = render_table(
             &[occupied(3000, vec![bare(5, "node")])],
             &TableOptions::default(),
         );
-        assert!(out.contains("—"), "no details should render a placeholder");
+        assert!(
+            out.contains("—"),
+            "missing fields should render a placeholder"
+        );
 
         let mut with_uptime = occupied(3000, vec![bare(5, "node")]);
         with_uptime.processes[0].uptime_secs = Some(3724);
         let out = render_table(&[with_uptime], &TableOptions::default());
-        assert!(out.contains("up 1h 2m 4s"), "uptime fallback:\n{out}");
+        assert!(out.contains("1h 2m 4s"), "uptime rendered:\n{out}");
     }
 
     #[test]
