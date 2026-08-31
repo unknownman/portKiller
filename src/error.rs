@@ -25,6 +25,8 @@ pub enum AppError {
         "port {port} requires elevated privileges to inspect or is protected by the system. \
          Try running `pk` with `sudo` (on macOS/Linux)."
     )]
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    // constructed only by the unix providers / unix signal impl
     AccessDenied { port: u16 },
 
     /// A platform command (e.g. `lsof`, `netstat`) exited non-zero.

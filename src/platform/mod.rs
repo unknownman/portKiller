@@ -15,13 +15,16 @@
 //!   data, and are exhaustively unit-tested against mock OS output.
 //!
 //! The `cfg` routing below picks exactly one concrete provider at compile time.
+//! Each platform module carries an explicit positive `#[cfg(target_os = ...)]`
+//! gate so an unsupported `target_os` (e.g. FreeBSD/OpenBSD) never tries to
+//! compile the Linux `/proc` module and fail with confusing errors.
 
-// `linux` is the compile-time default and is therefore compiled on *every*
-// platform, but it is only reached on non-macOS/non-Windows hosts. On macOS and
-// Windows the whole module is legitimately dormant (no call site reaches it), so
-// we scope the allowance to exactly those platforms; on Linux the allow vanishes
-// and genuinely unused items are still caught.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+/// Safety net: fail fast with a clear message rather than a baffling `/proc`
+/// build error on any platform we do not ship.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+compile_error!("Unsupported platform. portkill currently supports Linux, macOS, and Windows.");
+
+#[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
@@ -89,7 +92,7 @@ impl PlatformProvider for Platform {
     fn get_processes_on_port(&self, port: u16) -> Result<Vec<ProcessInfo>, AppError> {
         macos::get_processes_on_port(port)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
     fn get_processes_on_port(&self, port: u16) -> Result<Vec<ProcessInfo>, AppError> {
         linux::get_processes_on_port(port)
     }
@@ -102,7 +105,7 @@ impl PlatformProvider for Platform {
     fn is_port_free(&self, port: u16) -> Result<bool, AppError> {
         macos::is_port_free(port)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
     fn is_port_free(&self, port: u16) -> Result<bool, AppError> {
         linux::is_port_free(port)
     }
