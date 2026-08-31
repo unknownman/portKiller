@@ -29,6 +29,8 @@ use crate::render::{
     PortResult, ProcessStatus, RunMode, SignalKind, TableOptions, render_json, render_table,
 };
 
+use colored::Colorize;
+
 /// Injected dependencies for the execution lifecycle.
 pub struct Runner<'a> {
     pub provider: &'a dyn PlatformProvider,
@@ -111,7 +113,7 @@ pub fn run(runner: &Runner, cli: &Cli, mut confirm: impl FnMut() -> bool) -> i32
             emit_mode(&results, cli.json, RunMode::Confirming);
         }
         if !confirm() {
-            emit_mode(&results, cli.json, RunMode::Aborted);
+            println!("{}", "Aborted — no processes were terminated.".yellow());
             return exit::OK;
         }
     }

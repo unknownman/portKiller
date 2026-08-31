@@ -208,8 +208,6 @@ pub enum RunMode {
     /// [`RunMode::Inspect`] but without the "inspect only" verdict footer,
     /// since they are already in the kill flow.
     Confirming,
-    /// The user declined the confirmation prompt.
-    Aborted,
 }
 
 /// Tuning knobs for the human table renderer.
@@ -298,7 +296,6 @@ mod tests {
         assert!(!TableOptions::default().show_status());
         assert!(TableOptions::new(RunMode::DryRun).show_status());
         assert!(TableOptions::new(RunMode::Kill).show_status());
-        assert!(!TableOptions::new(RunMode::Aborted).show_status());
         assert!(!TableOptions::new(RunMode::Confirming).show_status());
     }
 }

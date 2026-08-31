@@ -128,20 +128,24 @@ pk --kill 8080
 pk -k 8080
 ```
 
-`pk --kill` sends `SIGTERM`, then **verifies** the port was released. If the process ignores `SIGTERM`, portkill escalates to `SIGKILL` automatically and re-checks.
+`pk --kill` shows you what it's about to do, asks for confirmation, then sends `SIGTERM` and **verifies** the port was released. If the process ignores `SIGTERM`, portkill escalates to `SIGKILL` automatically and re-checks.
 
 ```
-Port 8080 — in use
-┌────────┬──────────┬───────────────────────┬──────────┬─────────────┐
-│ PID    │ Process  │ Command               │ User     │ Uptime      │
-├────────┼──────────┼───────────────────────┼──────────┼─────────────┤
-│ 53811  │ rails    │ rails server          │ alijoder │ 3h 11m 05s  │
-└────────┴──────────┴───────────────────────┴──────────┴─────────────┘
+$ pk --kill 8080
+Proceed with termination? [y/N] y
 
-→ Sending SIGTERM to PID 53811…
-→ Terminated (graceful).
+Port 8080 — in use
+
+┌────────┬──────────┬───────────────────────┬──────────┬─────────────┬──────────────────────┐
+│ PID    │ Process  │ Command               │ User     │ Uptime      │ STATUS               │
+├────────┼──────────┼───────────────────────┼──────────┼─────────────┼──────────────────────┤
+│ 53811  │ rails    │ rails server          │ alijoder │ 3h 11m 05s  │ Terminated (SIGTERM) │
+└────────┴──────────┴───────────────────────┴──────────┴─────────────┴──────────────────────┘
+
   ✓ Port 8080 is now free.
 ```
+
+The `STATUS` column records exactly how each process ended — `Terminated (SIGTERM)` for a graceful kill, or `Killed (SIGKILL)` if it had to be escalated. Decline the prompt and nothing is touched: portkill prints `Aborted — no processes were terminated.` and exits `0`.
 
 ### Force kill (skip SIGTERM)
 
@@ -149,10 +153,19 @@ Port 8080 — in use
 pk --force 5432
 ```
 
-`--force` implies kill intent and jumps straight to `SIGKILL` — for processes that never listen to polite signals. Use it on Windows (where `SIGTERM` behaves differently), on zombie processes, or when you're already certain.
+`--force` implies kill intent and jumps straight to `SIGKILL` (no confirmation prompt) — for processes that never listen to polite signals. Use it on Windows (where `SIGTERM` behaves differently), on zombie processes, or when you're already certain.
 
 ```
-→ Sending SIGKILL to PID 4011…
+$ pk --force 5432
+
+Port 5432 — in use
+
+┌────────┬──────────┬───────────────────────────────┬──────────┬─────────────┬───────────────────┐
+│ PID    │ Process  │ Command                       │ User     │ Uptime      │ STATUS            │
+├────────┼──────────┼───────────────────────────────┼──────────┼─────────────┼───────────────────┤
+│ 4011   │ postgres │ postgres -D /usr/local/var/pg │ alijoder │ 2d 4h 13m   │ Killed (SIGKILL)  │
+└────────┴──────────┴───────────────────────────────┴──────────┴─────────────┴───────────────────┘
+
   ✓ Port 5432 is now free.
 ```
 
@@ -216,10 +229,10 @@ ARGS:
   <PORT>...   One or more ports, or ranges like 9000-9005
 
 OPTIONS:
-  -k, --kill      Kill processes occupying the given ports (SIGTERM → SIGKILL escalation)
-  -f, --force     Skip SIGTERM; go straight to SIGKILL. Implies --kill
+  -k, --kill      Gracefully kill processes (SIGTERM, verify, escalate to SIGKILL)
+  -f, --force     Skip SIGTERM; go straight to SIGKILL. Implies --kill (alias -y)
+      --dry-run   Show what --kill would do, without sending any signals
       --json      Output machine-readable JSON
-  -v, --verbose   Verbose diagnostics
   -h, --help      Print help
   -V, --version   Print version
 ```

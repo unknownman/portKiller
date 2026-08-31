@@ -46,11 +46,6 @@ pub fn render_table(results: &[PortResult], opts: &TableOptions) -> String {
             RunMode::DryRun => {
                 out.push_str(&"Dry run — no signals were sent.\n".yellow().to_string())
             }
-            RunMode::Aborted => out.push_str(
-                &"Aborted — no processes were terminated.\n"
-                    .yellow()
-                    .to_string(),
-            ),
             RunMode::Inspect | RunMode::Kill | RunMode::Confirming => {}
         }
     }
@@ -113,7 +108,6 @@ fn port_verdict(port: &PortResult, opts: &TableOptions) -> String {
                 out
             }
         }
-        RunMode::Aborted => String::new(),
         // Already in the kill flow: print the table as-is, but skip the
         // "inspect only — run `pk --kill`" hint that would be confusing.
         RunMode::Confirming => String::new(),
@@ -419,15 +413,6 @@ mod tests {
         assert!(out.contains("⚠"));
         assert!(out.contains("could not inspect port 80"));
         assert!(out.contains("requires elevated privileges"));
-    }
-
-    #[test]
-    fn abort_footer_only_after_an_aborted_confirmation() {
-        no_color();
-        let result = occupied(3000, vec![bare(5, "node")]);
-        let out = render_table(&[result], &TableOptions::new(RunMode::Aborted));
-        assert!(out.contains("Aborted — no processes were terminated."));
-        assert!(!out.contains("STATUS"));
     }
 
     #[test]
