@@ -4,24 +4,13 @@
 
 **portkill** is a lightweight, blazing-fast CLI for inspecting and freeing ports on macOS, Linux, and Windows. It shows you exactly *what* is squatting on a port before you decide what to do it — and it never kills anything unless you explicitly tell it to.
 
-[![Crates.io](https://img.shields.io/crates/v/portkill.svg)](https://crates.io/crates/portkill)
+[![Crates.io](https://img.shields.io/crates/v/portkill-cli.svg)](https://crates.io/crates/portkill-cli)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Build Status](https://img.shields.io/github/actions/workflow/status/alijoder/portkill/ci.yml?branch=main)](https://github.com/alijoder/portkill/actions)
-
-<!-- Maintainer: replace `OWNER` in the Build Status badge URLs above with the actual GitHub org/repo slug. -->
+[![Build Status](https://img.shields.io/github/actions/workflow/status/alijoder/portkill/release.yml?branch=main)](https://github.com/alijoder/portkill/actions)
 
 ## Demo
 
 ![portkill demo](./assets/demo.gif)
-
-<!--
-Maintainer: record the demo with `asciinema` or similar, ~30s, then convert to GIF.
-It should show:
-1. `pk 3000` — a beautiful, colorized process table (PID, name, command, user, uptime).
-2. `pk --kill 3000` — the graceful kill sequence: SIGTERM, verification, SIGKILL escalation on failure,
-   and the final "✓ Port 3000 is free." confirmation line.
-3. (Bonus) `pk --json 3000` piped through `jq` to show scripting bliss.
--->
 
 ## Features
 
