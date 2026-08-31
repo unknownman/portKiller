@@ -65,13 +65,13 @@ pub fn run(runner: &Runner, cli: &Cli, mut confirm: impl FnMut() -> bool) -> i32
     let mut results = inspect_ports(runner.provider, &ports);
 
     // 3. Early terminal states.
-    if results.iter().all(|r| r.is_free()) {
+    if !results.iter().any(|r| r.is_occupied()) {
         emit(&results, cli.json);
-        return exit::NOTHING_FOUND;
-    }
-    if results.iter().all(|r| r.is_error()) {
-        emit(&results, cli.json);
-        return exit::USAGE_OR_INTERNAL;
+        if results.iter().any(|r| r.is_error()) {
+            return exit::USAGE_OR_INTERNAL;
+        } else {
+            return exit::NOTHING_FOUND;
+        }
     }
 
     let kill_intent = cli.kill || cli.force;
