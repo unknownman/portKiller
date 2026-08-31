@@ -320,7 +320,10 @@ mod tests {
         let out = render_table(&[result], &TableOptions::new(RunMode::DryRun));
         assert!(out.contains("STATUS"), "dry run must show STATUS column");
         assert!(
-            out.contains(&format!("[Dry Run] Would send {}", SignalKind::Sigterm.name())),
+            out.contains(&format!(
+                "[Dry Run] Would send {}",
+                SignalKind::Sigterm.name()
+            )),
             "missing badge:\n{out}"
         );
         assert!(out.contains("Dry run — no signals were sent."));
