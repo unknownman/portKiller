@@ -50,14 +50,6 @@
 cargo install portkill
 ```
 
-### Homebrew
-
-```bash
-brew install portkill/tap/pk
-```
-
-> 🚧 **Upcoming:** the Homebrew tap is on the roadmap. For now, `brew install` is a placeholder — use Cargo or a pre-built binary until the tap ships.
-
 ### Pre-compiled binaries
 
 Grab the latest release for your platform from the [GitHub Releases](https://github.com/alijoder/portkill/releases) page. Each release bundles checksums and universal (fat) binaries for macOS, per-arch binaries for Linux, and `x86_64`/`aarch64` builds for Windows.
