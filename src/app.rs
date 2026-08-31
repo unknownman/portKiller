@@ -74,6 +74,18 @@ pub fn run(runner: &Runner, cli: &Cli, mut confirm: impl FnMut() -> bool) -> i32
 
     let kill_intent = cli.kill || cli.force;
 
+    // Interactive kills are incompatible with JSON mode: the confirmation prompt
+    // would block forever on stdin (hanging CI pipelines) and its `print!` to
+    // stdout would corrupt the JSON stream that `jq` must parse. Reject the
+    // combination up front; `--force` is the non-interactive, machine-friendly
+    // path. This guard runs before `kill_intent` is ever checked.
+    if cli.json && cli.kill && !cli.force {
+        eprintln!(
+            "error: Cannot use --kill interactively with --json. Use --force to confirm termination."
+        );
+        return exit::USAGE_OR_INTERNAL;
+    }
+
     // 4. Dry-run: annotate every row with what *would* happen, touch nothing.
     if cli.dry_run {
         stamp_dry_run(&mut results, cli.force);
@@ -366,6 +378,28 @@ mod tests {
         assert!(
             calls.lock().unwrap().is_empty(),
             "declined confirmation must not send signals"
+        );
+    }
+
+    #[test]
+    fn json_kill_without_force_exits_with_error() {
+        let provider = FakeProvider {
+            processes: vec![ProcessInfo::bare(1234, "node".into())],
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let signals = Recorder {
+            calls: calls.clone(),
+        };
+        // --json + --kill (no --force) must be rejected up front, so confirm() is
+        // never invoked and no signal is ever sent — even if the user would say
+        // "yes".
+        let mut args = cli(&["3000"], true, false, false);
+        args.json = true;
+        let code = run(&runner(&provider, &signals), &args, || true);
+        assert_eq!(code, exit::USAGE_OR_INTERNAL);
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "rejected interactive --json kill must not send any signals"
         );
     }
 
