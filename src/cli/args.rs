@@ -87,3 +87,14 @@ Exit codes:
     2   A kill failed (permission denied, port still occupied)
     3   Usage error or internal error
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn verify_cli_app() {
+        Cli::command().debug_assert();
+    }
+}

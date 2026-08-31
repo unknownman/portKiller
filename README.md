@@ -6,7 +6,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/portkill.svg)](https://crates.io/crates/portkill)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Build Status](https://img.shields.io/github/actions/workflow/status/OWNER/portkill/ci.yml?branch=main)](https://github.com/OWNER/portkill/actions)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/alijoder/portkill/ci.yml?branch=main)](https://github.com/alijoder/portkill/actions)
 
 <!-- Maintainer: replace `OWNER` in the Build Status badge URLs above with the actual GitHub org/repo slug. -->
 
@@ -71,13 +71,13 @@ brew install portkill/tap/pk
 
 ### Pre-compiled binaries
 
-Grab the latest release for your platform from the [GitHub Releases](https://github.com/OWNER/portkill/releases) page. Each release bundles checksums and universal (fat) binaries for macOS, per-arch binaries for Linux, and `x86_64`/`aarch64` builds for Windows.
+Grab the latest release for your platform from the [GitHub Releases](https://github.com/alijoder/portkill/releases) page. Each release bundles checksums and universal (fat) binaries for macOS, per-arch binaries for Linux, and `x86_64`/`aarch64` builds for Windows.
 
 Quick macOS/Linux one-liner:
 
 ```bash
 # Replace VERSION with the latest release tag
-curl -fsSL https://github.com/OWNER/portkill/releases/latest/download/pk-$(uname -s)-$(uname -m).tar.gz \
+curl -fsSL https://github.com/alijoder/portkill/releases/latest/download/pk-$(uname -s)-$(uname -m).tar.gz \
   | tar -xz -C /usr/local/bin
 ```
 
@@ -97,17 +97,14 @@ pk --version
 pk 3000
 ```
 
-```
+```text
 Port 3000 — in use
 
-┌────────┬──────────┬───────────────────────┬──────────┬─────────────┐
-│ PID    │ Process  │ Command               │ User     │ Uptime      │
-├────────┼──────────┼───────────────────────┼──────────┼─────────────┤
-│ 44122  │ node     │ node server.js        │ alijoder │ 1h 2m 13s   │
-│ 51204  │ vite     │ vite --port 3000      │ alijoder │ 12m 44s     │
-└────────┴──────────┴───────────────────────┴──────────┴─────────────┘
+PORT   PID    PROCESS  COMMAND           USER      UPTIME
+3000   44122  node     node server.js    alijoder  1h 2m 13s
+3000   51204  vite     vite --port 3000  alijoder  12m 44s
 
-2 process(es) occupying port 3000. Run `pk --kill 3000` to stop them.
+2 process(es) on port 3000; inspect only — run `pk --kill 3000` to free them.
 ```
 
 Empty port?
@@ -116,8 +113,8 @@ Empty port?
 pk 3000
 ```
 
-```
-Port 3000 — free ✓
+```text
+✨ Port 3000 is free.
 ```
 
 ### Kill a port
@@ -130,19 +127,21 @@ pk -k 8080
 
 `pk --kill` shows you what it's about to do, asks for confirmation, then sends `SIGTERM` and **verifies** the port was released. If the process ignores `SIGTERM`, portkill escalates to `SIGKILL` automatically and re-checks.
 
-```
+```text
 $ pk --kill 8080
+Port 8080 — in use
+
+PORT   PID    PROCESS  COMMAND       USER      UPTIME
+8080   53811  rails    rails server  alijoder  3h 11m 5s
+
 Proceed with termination? [y/N] y
 
 Port 8080 — in use
 
-┌────────┬──────────┬───────────────────────┬──────────┬─────────────┬──────────────────────┐
-│ PID    │ Process  │ Command               │ User     │ Uptime      │ STATUS               │
-├────────┼──────────┼───────────────────────┼──────────┼─────────────┼──────────────────────┤
-│ 53811  │ rails    │ rails server          │ alijoder │ 3h 11m 05s  │ Terminated (SIGTERM) │
-└────────┴──────────┴───────────────────────┴──────────┴─────────────┴──────────────────────┘
+PORT   PID    PROCESS  COMMAND       USER      UPTIME     STATUS
+8080   53811  rails    rails server  alijoder  3h 11m 5s  Terminated (SIGTERM)
 
-  ✓ Port 8080 is now free.
+✓ Port 8080 is now free.
 ```
 
 The `STATUS` column records exactly how each process ended — `Terminated (SIGTERM)` for a graceful kill, or `Killed (SIGKILL)` if it had to be escalated. Decline the prompt and nothing is touched: portkill prints `Aborted — no processes were terminated.` and exits `0`.
@@ -155,18 +154,15 @@ pk --force 5432
 
 `--force` implies kill intent and jumps straight to `SIGKILL` (no confirmation prompt) — for processes that never listen to polite signals. Use it on Windows (where `SIGTERM` behaves differently), on zombie processes, or when you're already certain.
 
-```
+```text
 $ pk --force 5432
 
 Port 5432 — in use
 
-┌────────┬──────────┬───────────────────────────────┬──────────┬─────────────┬───────────────────┐
-│ PID    │ Process  │ Command                       │ User     │ Uptime      │ STATUS            │
-├────────┼──────────┼───────────────────────────────┼──────────┼─────────────┼───────────────────┤
-│ 4011   │ postgres │ postgres -D /usr/local/var/pg │ alijoder │ 2d 4h 13m   │ Killed (SIGKILL)  │
-└────────┴──────────┴───────────────────────────────┴──────────┴─────────────┴───────────────────┘
+PORT   PID   PROCESS   COMMAND                        USER      UPTIME     STATUS
+5432   4011  postgres  postgres -D /usr/local/var/pg  alijoder  2d 4h 13m  Killed (SIGKILL)
 
-  ✓ Port 5432 is now free.
+✓ Port 5432 is now free.
 ```
 
 ### Multiple ports & ranges
@@ -194,14 +190,20 @@ pk --json 3000
   "ports": [
     {
       "port": 3000,
+      "protocol": "tcp",
       "free": false,
+      "error": null,
       "processes": [
         {
           "pid": 44122,
           "name": "node",
           "command": "node server.js",
           "user": "alijoder",
-          "uptime_seconds": 3724
+          "uptime_seconds": 3724,
+          "cwd": null,
+          "status": "info",
+          "signal": null,
+          "error": null
         }
       ],
       "killed": false,
@@ -217,6 +219,8 @@ Pipe it anywhere:
 pk --json 3000 | jq '.ports[].processes[].name'   # → "node"
 pk --json 8000 | jq -c 'select(.ports[].free == false)'  # fail-safe in CI
 ```
+
+> **Note:** On Windows, `kill_signal` reports `"SIGTERM"` or `"SIGKILL"` as logical intents, even though both map directly to `TerminateProcess` under the hood.
 
 `--json` stays machine-stable: field names are guaranteed, unknown fields are never added in patch releases, and `killed`/`kill_signal` only describe the current invocation (they're `false`/`null` on pure inspect runs).
 
