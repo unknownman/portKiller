@@ -54,7 +54,7 @@ pub fn parse_netstat(output: &str, port: u16) -> Vec<NetstatRow> {
             continue;
         }
         let state_ok = fields[3].eq_ignore_ascii_case("LISTENING");
-        let Some(local_port) = port_of(&fields[1]) else {
+        let Some(local_port) = port_of(fields[1]) else {
             continue;
         };
         let Some(pid) = fields[4].parse::<u32>().ok() else {
