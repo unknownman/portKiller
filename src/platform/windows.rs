@@ -18,17 +18,15 @@
 //! * **IO** (`run_netstat`) invokes the binary.
 //! * **Parsing** (`parse_netstat`) consumes raw text into rows, unit-tested.
 //!
-//! Enrichment (user/cmdline/uptime) on Windows is deferred; we surface the PID
-//! with a fallback name so identification remains sound.
+//! ## Name resolution is deferred to `sysinfo`
+//!
+//! We do **not** call `CreateToolhelp32Snapshot` per PID here — that takes a
+//! whole-process snapshot for every process, which is unacceptably slow on
+//! Windows. Each row is yielded as a placeholder `"pid-{pid}"` name; the shared
+//! [`crate::process::enrich::ProcessEnricher`] (one optimized `sysinfo`
+//! snapshot per batch) overwrites it with the real executable name.
 
 use std::process::Command;
-
-#[cfg(windows)]
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-#[cfg(windows)]
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
-};
 
 use crate::error::AppError;
 use crate::process::ProcessInfo;
@@ -103,64 +101,6 @@ fn run_netstat() -> Result<String, AppError> {
     }
 }
 
-/// Resolve a PID to its executable name (`node.exe`) via a snapshot of all
-/// system processes. Returns `None` if the snapshot cannot be taken (e.g. a
-/// permission issue) or the PID no longer exists. The snapshot handle is always
-/// closed, even on the error path.
-fn get_process_name(pid: u32) -> Option<String> {
-    #[cfg(windows)]
-    {
-        // TH32CS_SNAPPROCESS takes a snapshot of every process (no matching
-        // PID in the class filter); we then walk it for our target.
-        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-        if snapshot == INVALID_HANDLE_VALUE {
-            return None;
-        }
-
-        // `guard` ensures CloseHandle runs on every exit path.
-        struct SnapshotHandle(HANDLE);
-        impl Drop for SnapshotHandle {
-            fn drop(&mut self) {
-                unsafe {
-                    CloseHandle(self.0);
-                }
-            }
-        }
-        let _guard = SnapshotHandle(snapshot);
-
-        let mut entry = PROCESSENTRY32W {
-            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-            ..unsafe { std::mem::zeroed() }
-        };
-        if unsafe { Process32FirstW(snapshot, &mut entry) } == 0 {
-            return None;
-        }
-
-        loop {
-            if entry.th32ProcessID == pid {
-                return Some(wide_to_string(&entry.szExeFile));
-            }
-            if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
-                return None; // reached the end of the snapshot
-            }
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        // No-op on non-Windows; callers fall back to `pid-{pid}`.
-        let _ = pid;
-        None
-    }
-}
-
-/// Convert a NUL-terminated `[u16; MAX_PATH]` wide char buffer to a `String`
-/// (lossy, mirroring `String::from_utf8_lossy` elsewhere in the codebase).
-#[cfg(windows)]
-fn wide_to_string(buf: &[u16]) -> String {
-    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    String::from_utf16_lossy(&buf[..len])
-}
-
 /// Return the processes bound to `port` (TCP, LISTENING). Empty vec when free.
 ///
 /// A single process binding the same port over both IPv4 and IPv6 produces two
@@ -171,10 +111,7 @@ pub fn get_processes_on_port(port: u16) -> Result<Vec<ProcessInfo>, AppError> {
     let rows = parse_netstat(&raw, port);
     let procs: Vec<ProcessInfo> = rows
         .into_iter()
-        .map(|r| {
-            let name = get_process_name(r.pid).unwrap_or_else(|| format!("pid-{}", r.pid));
-            ProcessInfo::bare(r.pid, name)
-        })
+        .map(|r| ProcessInfo::bare(r.pid, format!("pid-{}", r.pid)))
         .collect();
     Ok(dedup_by_pid(procs))
 }

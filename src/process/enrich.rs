@@ -53,7 +53,13 @@ impl ProcessEnricher {
     }
 
     /// Enrich a single process against the shared system snapshot, leaving any
-    /// metadata the platform already provided untouched.
+    /// metadata the platform already provided untouched (except the placeholder
+    /// name, which is replaced as described below).
+    ///
+    /// Some platforms can only supply a PID cheaply and yield a synthetic
+    /// `"pid-{n}"` name (e.g. Windows). `sysinfo` reads the real executable
+    /// name from the same snapshot it already took for command/user/cwd, so we
+    /// use it to overwrite that placeholder (or an empty name) at no extra cost.
     ///
     /// Returns the (possibly unchanged) process. This is deliberately not
     /// `Result`: a best-effort enrichment failure should not abort an inspection.
@@ -64,6 +70,13 @@ impl ProcessEnricher {
             // bare metadata rather than guessing.
             return process;
         };
+
+        if process.name.starts_with("pid-") || process.name.is_empty() {
+            let real_name = sysinfo_proc.name().to_string();
+            if !real_name.is_empty() {
+                process.name = real_name;
+            }
+        }
 
         if process.command.is_none() {
             let cmd = sysinfo_proc.cmd().join(" ").trim().to_string();
@@ -94,5 +107,29 @@ impl ProcessEnricher {
 impl Default for ProcessEnricher {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_placeholder_name_is_overwritten_by_sysinfo() {
+        // The test's own process is guaranteed to exist in the snapshot, so its
+        // PID resolves. A synthetic "pid-{pid}" placeholder must be replaced by
+        // the real executable name from sysinfo.
+        let pid = std::process::id();
+        let mut enricher = ProcessEnricher::new();
+        let enriched = enricher.enrich(ProcessInfo::bare(pid, format!("pid-{pid}")));
+
+        assert!(
+            !enriched.name.is_empty(),
+            "placeholder name must be replaced with the real process name"
+        );
+        assert!(
+            !enriched.name.starts_with("pid-"),
+            "name must no longer be a synthetic pid- placeholder"
+        );
     }
 }
