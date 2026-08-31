@@ -23,10 +23,23 @@ pub enum SignalKind {
 }
 
 impl SignalKind {
-    /// The short uppercase name shown to humans and in JSON (`"SIGTERM"`).
+    /// The short uppercase name shown to humans and in dry-run/status text.
+    ///
+    /// Platform-honest: on Windows both `Signal::Terminate` and `Signal::Kill`
+    /// are delivered as `TerminateProcess`, so we say so rather than claim a
+    /// POSIX signal that was never actually sent. (The JSON `signal` /
+    /// `kill_signal` fields are the machine-stable *logical* request names —
+    /// `SIGTERM`/`SIGKILL` — and are unaffected, matching the README contract.)
     pub const fn name(self) -> &'static str {
         match self {
+            // Windows executes every signal as TerminateProcess; naming it
+            // SIGTERM/SIGKILL would mislead ("Terminated (SIGTERM)" when the
+            // process was hard-terminated).
+            #[cfg(windows)]
+            SignalKind::Sigterm | SignalKind::Sigkill => "TERMINATEPROCESS",
+            #[cfg(not(windows))]
             SignalKind::Sigterm => "SIGTERM",
+            #[cfg(not(windows))]
             SignalKind::Sigkill => "SIGKILL",
         }
     }
