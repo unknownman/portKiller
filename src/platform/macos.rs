@@ -73,7 +73,12 @@ pub struct LsofRow {
 /// * `NAME` = the socket path from the right side; we keep a row only when it
 ///   reports `(LISTEN)` and carries the target port.
 pub fn parse_lsof_listen(output: &str, port: u16) -> Vec<LsofRow> {
-    let port_spec = format!(":{port}");
+    // `lsof -sTCP:LISTEN` guarantees every row ends with `(LISTEN)`, so the
+    // exact-port match is the socket name's port column followed by the state
+    // verb. Anchoring on `:(port) (LISTEN)` — rather than the bare `:(port)`
+    // substring — prevents false positives like `:8080`/`:8000` matching a
+    // search for port `80`.
+    let port_spec = format!(":{port} (LISTEN)");
     let mut rows = Vec::new();
     for line in output.lines().skip(1) {
         let line = line.trim();
@@ -111,7 +116,7 @@ pub fn parse_lsof_listen(output: &str, port: u16) -> Vec<LsofRow> {
 
         // NAME is the socket path on the strictly-formatted right side.
         let name = tokens[type_idx + 3..].join(" ");
-        if !name.contains("(LISTEN)") || !name.contains(&port_spec) {
+        if !name.contains(&port_spec) {
             continue; // established/outbound socket, or a different port
         }
 
@@ -421,6 +426,21 @@ real       600 alijoder    5u  IPv6  99995      0t0  TCP [::1]:3000             
         );
         assert!(a);
         assert_eq!(b, 2);
+    }
+
+    #[test]
+    fn port_80_ignores_8080_and_8000_listeners() {
+        // Port 80 must NOT be a substring match: `:8080` and `:8000` start with
+        // `:80` but are different ports. Anchoring the match on the `(LISTEN)`
+        // suffix guarantees only the true `:80` row survives.
+        let raw = "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n\
+                   nginx 100 alijoder 3u IPv4 4444 0t0 TCP 127.0.0.1:80 (LISTEN)\n\
+                   node  200 alijoder 4u IPv4 5555 0t0 TCP 127.0.0.1:8080 (LISTEN)\n\
+                   go    300 alijoder 5u IPv4 6666 0t0 TCP [::1]:8000 (LISTEN)\n";
+        let rows = parse_lsof_listen(raw, 80);
+        assert_eq!(rows.len(), 1, "only the true :80 listener should match");
+        assert_eq!(rows[0].pid, 100);
+        assert!(rows[0].name.contains("127.0.0.1:80 (LISTEN)"));
     }
 
     #[test]
