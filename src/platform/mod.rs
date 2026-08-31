@@ -16,12 +16,17 @@
 //!
 //! The `cfg` routing below picks exactly one concrete provider at compile time.
 
+// `linux` is the compile-time default and is therefore compiled on *every*
+// platform, but it is only reached on non-macOS/non-Windows hosts. On macOS and
+// Windows the whole module is legitimately dormant (no call site reaches it), so
+// we scope the allowance to exactly those platforms; on Linux the allow vanishes
+// and genuinely unused items are still caught.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
-
 use crate::error::AppError;
 use crate::process::ProcessInfo;
 

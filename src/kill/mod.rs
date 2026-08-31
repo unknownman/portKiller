@@ -74,6 +74,7 @@ pub enum KillOutcome {
 impl KillOutcome {
     /// True when the target process was verified gone from the port, regardless
     /// of which signal was used.
+    #[cfg_attr(not(test), allow(dead_code))] // exercised by the test suite only
     pub fn is_success(&self) -> bool {
         matches!(
             self,

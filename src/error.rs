@@ -29,6 +29,8 @@ pub enum AppError {
 
     /// A platform command (e.g. `lsof`, `netstat`) exited non-zero.
     #[error("the system command `{command}` failed: {message}")]
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    // constructed only by the macos/windows providers
     OsCommandFailed {
         command: &'static str,
         message: String,
@@ -36,11 +38,13 @@ pub enum AppError {
 
     /// The raw bytes a platform produced could not be understood.
     #[error("failed to interpret operating-system output for port {port}: {reason}")]
+    #[allow(dead_code)] // constructed by the linux provider, dormant on non-Linux hosts
     UnparseableOutput { port: u16, reason: String },
 
     /// Filesystem reads that are not access-control related (e.g. `/proc` races
     /// where a process vanished mid-scan).
     #[error("could not read {path}: {source}")]
+    #[allow(dead_code)] // constructed by the linux provider, dormant on non-Linux hosts
     Io {
         path: String,
         #[source]
@@ -50,6 +54,7 @@ pub enum AppError {
     /// A raw OS API call returned an unexpected status that is not a denied
     /// access. Kept generic; the platform module attaches context.
     #[error("operating-system API error: {message}")]
+    #[allow(dead_code)] // reserved for platform code that is dormant on this host
     OsApi { message: String },
 
     /// A requested kill could not be delivered or the port refused to free.
@@ -58,11 +63,14 @@ pub enum AppError {
 
     /// Usage or internal invariant violated — the "this is our fault" bucket.
     #[error("{message}")]
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    // constructed only by the unix signal impl
     Internal { message: String },
 }
 
 impl AppError {
     /// Convenience constructor for the internal/bug bucket.
+    #[cfg_attr(target_os = "windows", allow(dead_code))] // constructed only by the unix signal impl
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal {
             message: message.into(),
@@ -79,6 +87,7 @@ impl AppError {
     /// Convenience constructor for the I/O bucket that embeds the offending
     /// `path`, so callers can write `AppError::io(path, e)?` without building
     /// the variant by hand.
+    #[allow(dead_code)] // used by the linux provider, dormant on non-Linux hosts
     pub fn io(path: impl Into<String>, source: std::io::Error) -> Self {
         Self::Io {
             path: path.into(),

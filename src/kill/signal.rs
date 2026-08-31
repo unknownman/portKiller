@@ -59,11 +59,16 @@ pub trait SignalSender {
     fn send(&self, pid: u32, signal: Signal) -> Result<(), AppError>;
 }
 
-/// Convenience free functions that use the real OS sender.
+/// Convenience free functions that use the real OS sender. Kept as a thin,
+/// self-contained `OsSignals` API even though the escalation orchestrator calls
+/// [`SignalSender::send`] directly; declared public so the underlying OS signal
+/// behaviour stays reachable/documentable without wiring a full orchestrator.
+#[allow(dead_code)]
 pub fn send_sigterm(pid: u32) -> Result<(), AppError> {
     OsSignals.send(pid, Signal::Terminate)
 }
 
+#[allow(dead_code)]
 pub fn send_sigkill(pid: u32) -> Result<(), AppError> {
     OsSignals.send(pid, Signal::Kill)
 }

@@ -3,16 +3,14 @@
 //! Parses arguments, wires the real platform provider and signal sender into
 //! the application lifecycle, and maps the result to a process exit code.
 //!
-//! # `dead_code` allowance
+//! # Dormant platform code
 //!
 //! This crate ships complete per-OS implementations selected at compile time by
 //! `#[cfg(target_os)]`. On any single host the *other* platforms' modules are
-//! legitimate live code that no call site reaches, and several `AppError`
-//! variants are constructed only from those dormant modules. **Keep this
-//! allowance scoped and intentional**: it reflects genuinely cross-platform code
-//! that a single build environment cannot exercise, not disposable scaffolding.
-
-#![allow(dead_code)]
+//! legitimate live code that no call site reaches. Those items carry narrowly
+//! scoped `#[cfg_attr(not(target_os = ...), allow(dead_code))]` (or platform
+//! `#[allow(dead_code)]`) attributes directly above them, rather than a crate-
+//! wide suppression, so genuinely unused code elsewhere is still caught.
 
 mod app;
 mod cli;

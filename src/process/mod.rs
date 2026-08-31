@@ -19,6 +19,7 @@ pub mod enrich;
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
     Tcp,
+    #[cfg_attr(not(test), allow(dead_code))] // exercised by the serialization test only
     Udp,
 }
 
@@ -52,6 +53,7 @@ impl ProcessInfo {
     ///
     /// This is the canonical constructor for the "we found the PID but know
     /// nothing else" path; callers may then `.fill_metadata(...)` on top.
+    #[cfg_attr(not(test), allow(dead_code))] // exercised by the test suite only
     pub fn bare(pid: u32, name: String) -> Self {
         Self {
             pid,
@@ -65,7 +67,12 @@ impl ProcessInfo {
 }
 
 /// A single port bound on the local machine, along with the process occupying it.
+///
+/// This aggregate predates the current `Vec<ProcessInfo>`-per-port flow and is
+/// not yet reachable from any call site; kept available for future use rather
+/// than silently deleted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[allow(dead_code)]
 pub struct PortInfo {
     /// The bound port number.
     pub port: u16,
@@ -81,6 +88,7 @@ pub struct PortInfo {
 
 impl PortInfo {
     /// Create a `PortInfo` that reports the port as bound but with no known owner.
+    #[allow(dead_code)]
     pub fn occupied_unknown(port: u16, protocol: Protocol) -> Self {
         Self {
             port,
