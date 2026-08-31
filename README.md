@@ -4,7 +4,8 @@
 
 **portkill** is a lightweight, blazing-fast CLI for inspecting and freeing ports on macOS, Linux, and Windows. It shows you exactly *what* is squatting on a port before you decide what to do it —[...]
 
-[![Crates.io](https://img.shields.io/crates/v/portkill-cli.svg)](https://crates.io/crates/portkill-cli)
+[![GitHub Release](https://img.shields.io/github/v/release/unknownman/portKiller)](https://github.com/unknownman/portKiller/releases)
+[![docs.rs](https://docs.rs/portkill-cli/badge.svg)](https://docs.rs/portkill-cli)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Build Status](https://img.shields.io/github/actions/workflow/status/unknownman/portKiller/release.yml?branch=main)](https://github.com/unknownman/portKiller/actions)
 
