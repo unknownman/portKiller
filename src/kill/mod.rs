@@ -13,11 +13,14 @@
 //!
 //! # Trust through verification
 //!
-//! A kill is only reported as *Success* after [`PlatformProvider::is_port_free`]
-//! confirms the port actually released. If a graceful `SIGTERM` is ignored, we
-//! escalate to `SIGKILL` (unless `--force` skipped straight there). If even
-//! `SIGKILL` fails to free the port, the outcome is [`KillOutcome::Failed`] —
-//! reported honestly rather than assumed away.
+//! A kill is only reported as *Success* after
+//! [`PlatformProvider::is_process_gone_from_port`] confirms the target PID has
+//! actually dropped off the port. Verification is per-process (not per-port), so
+//! on a shared port killing one worker succeeds even while a sibling still
+//! listens. If a graceful `SIGTERM` is ignored, we escalate to `SIGKILL` (unless
+//! `--force` skipped straight there). If even `SIGKILL` fails to dislodge the
+//! target, the outcome is [`KillOutcome::Failed`] — reported honestly rather
+//! than assumed away.
 
 pub mod signal;
 
@@ -69,7 +72,8 @@ pub enum KillOutcome {
 }
 
 impl KillOutcome {
-    /// True when the port was verified free, regardless of signal used.
+    /// True when the target process was verified gone from the port, regardless
+    /// of which signal was used.
     pub fn is_success(&self) -> bool {
         matches!(
             self,
@@ -83,11 +87,16 @@ impl KillOutcome {
 // ---------------------------------------------------------------------------
 
 /// Terminate one process occupying `port`, escalating as necessary, and verify
-/// the port is actually free before returning success.
+/// *that specific process* is gone before returning success.
+///
+/// Verification is per-process, not per-port: on a shared port (e.g.
+/// `SO_REUSEPORT` workers) killing one PID must not be reported as a failure
+/// merely because a sibling still listens. Success is claimed once the target
+/// PID has dropped off the port.
 ///
 /// * `force == true`: jump straight to [`Signal::Kill`].
 /// * `force == false`: send [`Signal::Terminate`], wait up to `grace_timeout`,
-///   and only escalate to [`Signal::Kill`] if the port is still bound.
+///   and only escalate to [`Signal::Kill`] if the target is still present.
 ///
 /// No OS call is made here directly — both `signals` and `provider` are injected
 /// traits, which is what allows the loop to be tested in isolation.
@@ -103,14 +112,14 @@ pub fn terminate_one(
 
     if force {
         signals.send(pid, Signal::Kill)?;
-        return if poll_until_free(port, provider, cfg.final_verify, cfg) {
+        return if poll_until_gone(port, pid, provider, cfg.final_verify, cfg) {
             Ok(KillOutcome::ForcefulSuccess { port, pid })
         } else {
             Ok(KillOutcome::Failed {
                 port,
                 pid,
                 reason: format!(
-                    "port {port} still bound after SIGKILL to PID {pid} (zombie/stuck or restarted)"
+                    "PID {pid} still bound to port {port} after SIGKILL (zombie/stuck or restarted)"
                 ),
             })
         };
@@ -118,38 +127,40 @@ pub fn terminate_one(
 
     // Graceful attempt.
     signals.send(pid, Signal::Terminate)?;
-    if poll_until_free(port, provider, cfg.grace_timeout, cfg) {
+    if poll_until_gone(port, pid, provider, cfg.grace_timeout, cfg) {
         return Ok(KillOutcome::GracefulSuccess { port, pid });
     }
 
     // SIGTERM ignored or too slow — escalate.
     signals.send(pid, Signal::Kill)?;
-    if poll_until_free(port, provider, cfg.final_verify, cfg) {
+    if poll_until_gone(port, pid, provider, cfg.final_verify, cfg) {
         Ok(KillOutcome::ForcefulSuccess { port, pid })
     } else {
         Ok(KillOutcome::Failed {
             port,
             pid,
             reason: format!(
-                "port {port} still bound after SIGTERM→SIGKILL on PID {pid} (zombie/stuck or restarted)"
+                "PID {pid} still bound to port {port} after SIGTERM→SIGKILL (zombie/stuck or restarted)"
             ),
         })
     }
 }
 
-/// Poll `provider.is_port_free(port)` every `cfg.poll_interval` until `timeout`
-/// elapses. Returns true as soon as the port frees.
-fn poll_until_free(
+/// Poll `provider.is_process_gone_from_port(port, target_pid)` every
+/// `cfg.poll_interval` until `timeout` elapses. Returns true as soon as the
+/// target PID drops off the port.
+fn poll_until_gone(
     port: u16,
+    target_pid: u32,
     provider: &dyn PlatformProvider,
     timeout: Duration,
     cfg: &KillConfig,
 ) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        // Transient inspection errors are treated as "still occupied"; the
+        // Transient inspection errors are treated as "still present"; the
         // caller's final verdict decides, and we never over-report success.
-        if let Ok(true) = provider.is_port_free(port) {
+        if let Ok(true) = provider.is_process_gone_from_port(port, target_pid) {
             return true;
         }
         if Instant::now() >= deadline {
@@ -225,6 +236,21 @@ mod tests {
             unreachable!("tests drive termination directly")
         }
         fn is_port_free(&self, _port: u16) -> Result<bool, AppError> {
+            self.target_gone()
+        }
+        fn is_process_gone_from_port(
+            &self,
+            _port: u16,
+            _target_pid: u32,
+        ) -> Result<bool, AppError> {
+            self.target_gone()
+        }
+    }
+
+    impl MockProvider {
+        /// Whether the signal-driven mock has progressed far enough to consider
+        /// the (single, unnamed) target gone — shared by both free checks.
+        fn target_gone(&self) -> Result<bool, AppError> {
             let sent = self.signals.lock().unwrap();
             Ok(match self.free_when {
                 FreeWhen::Sigterm => sent.iter().any(|&(_, s)| s == Signal::Terminate),
@@ -367,5 +393,88 @@ mod tests {
             }
             .is_success()
         );
+    }
+
+    /// A signal sender that removes a pid from the shared occupant set when it
+    /// is signalled — modelling a worker that actually dies on signal.
+    struct KillOnSignal {
+        occupants: Arc<Mutex<Vec<u32>>>,
+    }
+    impl SignalSender for KillOnSignal {
+        fn send(&self, pid: u32, _signal: Signal) -> Result<(), AppError> {
+            self.occupants.lock().unwrap().retain(|&p| p != pid);
+            Ok(())
+        }
+    }
+
+    /// A shared-port provider: tracks which PIDs currently occupy the port and
+    /// reports the target gone iff *that pid* dropped off — never because the
+    /// whole port freed. This mirrors a real `SO_REUSEPORT` port where killing
+    /// PID 1 must not be reported failed while PID 2 still listens.
+    struct SharedPortProvider {
+        occupants: Arc<Mutex<Vec<u32>>>,
+    }
+    impl PlatformProvider for SharedPortProvider {
+        fn get_processes_on_port(&self, _port: u16) -> Result<Vec<ProcessInfo>, AppError> {
+            Ok(self
+                .occupants
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|&p| ProcessInfo::bare(p, "worker".into()))
+                .collect())
+        }
+        fn is_port_free(&self, _port: u16) -> Result<bool, AppError> {
+            Ok(self.occupants.lock().unwrap().is_empty())
+        }
+        fn is_process_gone_from_port(&self, _port: u16, target_pid: u32) -> Result<bool, AppError> {
+            Ok(!self.occupants.lock().unwrap().contains(&target_pid))
+        }
+    }
+
+    // Regression: two SO_REUSEPORT workers share one port. Killing worker 1234
+    // must be reported a success once *1234* drops off — the port being still
+    // occupied by worker 1235 must NOT turn this into KillOutcome::Failed.
+    #[test]
+    fn killing_one_worker_on_shared_port_succeeds() {
+        let occupants = Arc::new(Mutex::new(vec![1234u32, 1235u32]));
+        let outcome = terminate_one(
+            3000,
+            &proc(1234),
+            true, // force (or the escalation path — same verification)
+            &KillOnSignal {
+                occupants: occupants.clone(),
+            },
+            &SharedPortProvider {
+                occupants: occupants.clone(),
+            },
+            &KillConfig {
+                poll_interval: Duration::from_millis(1),
+                grace_timeout: Duration::from_millis(5),
+                final_verify: Duration::from_millis(5),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            KillOutcome::ForcefulSuccess {
+                port: 3000,
+                pid: 1234
+            },
+            "killing one SO_REUSEPORT worker must succeed even though the port \
+             is still held by a sibling"
+        );
+
+        // The target worker is gone...
+        assert_eq!(*occupants.lock().unwrap(), vec![1235u32]);
+        // ...but the port itself is still NOT free (the sibling remains). This
+        // is the crux: the old global `is_port_free` check would have misread
+        // the still-busy port as a failed kill of PID 1234.
+        let provider = SharedPortProvider {
+            occupants: occupants.clone(),
+        };
+        assert!(!provider.is_port_free(3000).unwrap());
+        assert!(outcome.is_success());
     }
 }

@@ -48,6 +48,29 @@ pub trait PlatformProvider {
     /// deliberately independent of process identification so the kill loop can
     /// confirm success even when it cannot name the offending process.
     fn is_port_free(&self, port: u16) -> Result<bool, AppError>;
+
+    /// Report whether `target_pid` is no longer occupying `port`.
+    ///
+    /// Unlike [`is_port_free`] — which is a *global* check and returns `false`
+    /// as long as *any* process (e.g. a second `SO_REUSEPORT` worker) still
+    /// holds the port — this verifies **this specific pid** dropped off. That is
+    /// the correct post-kill claim for a shared port, where killing one worker
+    /// must not be misreported as a failure just because a sibling still runs.
+    ///
+    /// The default does a port-wide free check first (fast path), then lists the
+    /// occupants and treats the target as gone as long as it is absent from that
+    /// list.
+    ///
+    /// [`is_port_free`]: PlatformProvider::is_port_free
+    fn is_process_gone_from_port(&self, port: u16, target_pid: u32) -> Result<bool, AppError> {
+        // Fast path: no one is on the port, so the target is certainly gone.
+        if self.is_port_free(port)? {
+            return Ok(true);
+        }
+        // Port still bound: succeed iff *this* pid no longer holds it.
+        let occupants = self.get_processes_on_port(port)?;
+        Ok(occupants.iter().all(|p| p.pid != target_pid))
+    }
 }
 
 /// The single real provider, selected at compile time per `target_os`.

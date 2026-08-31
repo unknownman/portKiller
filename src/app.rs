@@ -23,7 +23,7 @@ use crate::kill::signal::SignalSender;
 use crate::kill::{KillConfig, KillOutcome, terminate_one};
 use crate::platform::PlatformProvider;
 use crate::process::Protocol;
-use crate::process::enrich::enrich_process;
+use crate::process::enrich::ProcessEnricher;
 use crate::render::{
     PortResult, ProcessStatus, RunMode, SignalKind, TableOptions, render_json, render_table,
 };
@@ -151,15 +151,17 @@ pub fn run(runner: &Runner, cli: &Cli, mut confirm: impl FnMut() -> bool) -> i32
 /// Inspect every port, building one render view per requested port. A port
 /// that the OS refuses to inspect becomes an error-carrying view, never a
 /// fatal panic.
+///
+/// A single [`ProcessEnricher`] is created up front and shared across every
+/// discovered process, so the expensive `sysinfo` snapshot is taken once per
+/// inspection batch rather than once per process.
 fn inspect_ports(provider: &dyn PlatformProvider, ports: &[u16]) -> Vec<PortResult> {
+    let mut enricher = ProcessEnricher::new();
     let mut results = Vec::with_capacity(ports.len());
     for &port in ports {
         match provider.get_processes_on_port(port) {
             Ok(procs) if procs.is_empty() => results.push(PortResult::free(port)),
-            Ok(procs) => {
-                let enriched = procs.into_iter().map(enrich_process).collect();
-                results.push(PortResult::occupied(port, enriched));
-            }
+            Ok(procs) => results.push(PortResult::occupied(port, enricher.enrich_all(procs))),
             Err(e) => results.push(PortResult::inspection_error(
                 port,
                 Protocol::Tcp,
@@ -264,6 +266,13 @@ mod tests {
             Ok(self.processes.clone())
         }
         fn is_port_free(&self, _port: u16) -> Result<bool, AppError> {
+            Ok(true)
+        }
+        fn is_process_gone_from_port(
+            &self,
+            _port: u16,
+            _target_pid: u32,
+        ) -> Result<bool, AppError> {
             Ok(true)
         }
     }
