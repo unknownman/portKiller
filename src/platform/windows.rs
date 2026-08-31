@@ -162,16 +162,37 @@ fn wide_to_string(buf: &[u16]) -> String {
 }
 
 /// Return the processes bound to `port` (TCP, LISTENING). Empty vec when free.
+///
+/// A single process binding the same port over both IPv4 and IPv6 produces two
+/// `netstat` rows for the same PID; those are collapsed to one [`ProcessInfo`]
+/// per PID so the CLI never shows the same process twice.
 pub fn get_processes_on_port(port: u16) -> Result<Vec<ProcessInfo>, AppError> {
     let raw = run_netstat()?;
     let rows = parse_netstat(&raw, port);
-    Ok(rows
+    let procs: Vec<ProcessInfo> = rows
         .into_iter()
         .map(|r| {
             let name = get_process_name(r.pid).unwrap_or_else(|| format!("pid-{}", r.pid));
             ProcessInfo::bare(r.pid, name)
         })
-        .collect())
+        .collect();
+    Ok(dedup_by_pid(procs))
+}
+
+/// Collapse a list into one [`ProcessInfo`] per PID, preserving first-seen order.
+///
+/// `netstat` emits one row per (process, address family). When a process listens
+/// on both IPv4 and IPv6 for the same port it appears twice; keeping one entry
+/// per PID prevents duplicate CLI rows.
+fn dedup_by_pid(procs: Vec<ProcessInfo>) -> Vec<ProcessInfo> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(procs.len());
+    for p in procs {
+        if seen.insert(p.pid) {
+            out.push(p);
+        }
+    }
+    out
 }
 
 /// Report whether nothing is bound to `port` (TCP, LISTENING).
@@ -221,5 +242,28 @@ mod tests {
     fn empty_and_header_only_output_yields_nothing() {
         assert!(parse_netstat("", 3000).is_empty());
         assert!(parse_netstat("Proto  Local Address  Foreign  State  PID\n", 3000).is_empty());
+    }
+
+    // Regression: one process binding the same port on both IPv4 and IPv6 yields
+    // two netstat rows for the same PID, which must collapse to a single entry.
+    #[test]
+    fn ipv4_and_ipv6_listeners_for_same_pid_deduplicate() {
+        let dual = r#"Active Connections
+
+  Proto  Local Address          Foreign Address        State           PID
+  TCP    0.0.0.0:3000           0.0.0.0:0              LISTENING       44122
+  TCP    [::]:3000              [::]:0                 LISTENING       44122
+"#;
+        let rows = parse_netstat(dual, 3000);
+        assert_eq!(rows.len(), 2, "both address families must be parsed");
+        assert_eq!(rows[0].pid, rows[1].pid);
+
+        let procs: Vec<ProcessInfo> = rows
+            .into_iter()
+            .map(|r| ProcessInfo::bare(r.pid, format!("pid-{}", r.pid)))
+            .collect();
+        let deduped = dedup_by_pid(procs);
+        assert_eq!(deduped.len(), 1, "same PID across IPv4/IPv6 must collapse");
+        assert_eq!(deduped[0].pid, 44122);
     }
 }

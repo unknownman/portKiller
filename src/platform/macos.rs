@@ -129,13 +129,34 @@ fn run_lsof(port: u16) -> Result<String, AppError> {
 /// When `lsof` finds nothing we cross-check with `netstat`: a port that is
 /// occupied but invisible to us (a privileged owner) must surface as
 /// [`AppError::AccessDenied`], not as "free".
+///
+/// A single process binding the same port over both IPv4 and IPv6 produces one
+/// `lsof` row per family; those are collapsed to one [`ProcessInfo`] per PID so
+/// the CLI never shows the same process twice.
 pub fn get_processes_on_port(port: u16) -> Result<Vec<ProcessInfo>, AppError> {
     let raw = run_lsof(port)?;
     let rows = parse_lsof_listen(&raw, port);
     if rows.is_empty() {
         ensure_not_hidden(port)?;
     }
-    Ok(rows.into_iter().map(process_from_row).collect())
+    let procs: Vec<ProcessInfo> = rows.into_iter().map(process_from_row).collect();
+    Ok(dedup_by_pid(procs))
+}
+
+/// Collapse a list into one [`ProcessInfo`] per PID, preserving first-seen order.
+///
+/// `lsof` emits one row per (process, address family). When a process listens on
+/// both IPv4 and IPv6 for the same port it appears twice; keeping one entry per
+/// PID prevents duplicate CLI rows.
+fn dedup_by_pid(procs: Vec<ProcessInfo>) -> Vec<ProcessInfo> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(procs.len());
+    for p in procs {
+        if seen.insert(p.pid) {
+            out.push(p);
+        }
+    }
+    out
 }
 
 /// Report whether nothing is bound to `port` (TCP, LISTEN).
@@ -405,5 +426,23 @@ tcp4       0      0  *.22                  *.*                    LISTEN
         let raw_lsof = "COMMAND PID USER FD DEVICE SIZE/OFF NODE NAME\n";
         assert!(parse_lsof_listen(raw_lsof, 80).is_empty());
         assert!(parse_mac_netstat_listening(MOCK_NETSTAT, 80));
+    }
+
+    // Regression: one process binding the same port on both IPv4 and IPv6 yields
+    // two lsof rows for the same PID, which must collapse to a single entry.
+    #[test]
+    fn ipv4_and_ipv6_listeners_for_same_pid_deduplicate() {
+        let dual = r#"COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME
+node    44122 alijoder   21u  IPv4  12345      0t0  TCP 0.0.0.0:3000 (LISTEN)
+node    44122 alijoder   22u  IPv6  54321      0t0  TCP [::]:3000 (LISTEN)
+"#;
+        let rows = parse_lsof_listen(dual, 3000);
+        assert_eq!(rows.len(), 2, "both address families must be parsed");
+
+        let procs: Vec<ProcessInfo> = rows.into_iter().map(process_from_row).collect();
+        let deduped = dedup_by_pid(procs);
+        assert_eq!(deduped.len(), 1, "same PID across IPv4/IPv6 must collapse");
+        assert_eq!(deduped[0].pid, 44122);
+        assert_eq!(deduped[0].name, "node");
     }
 }
