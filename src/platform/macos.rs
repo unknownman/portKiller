@@ -60,10 +60,18 @@ pub struct LsofRow {
 /// descriptors. Without filtering we would report `rapportd`, `cwd`, `txt`
 /// rows, etc. as process (false positives), which this tool must never do.
 ///
-/// Column layout: `COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME`. The
-/// `NAME` column (from token 7 onward) holds any spaces, so it is rejoined.
-/// We keep a row only when its `TYPE` is `IPv4`/`IPv6`, its `NAME` reports
-/// `(LISTEN)`, and the name contains the target port.
+/// A `COMMAND` or `USER` may contain spaces, so **left-anchored** token indices
+/// are unreliable. `lsof` keeps the columns to the **right** of `FD` strictly
+/// formatted, so we anchor there:
+///
+/// * `COMMAND` = everything before the `PID`.
+/// * `PID` = the first purely-numeric token in the line (the dedicated PID
+///   column), regardless of how many words precede it.
+/// * `TYPE` = the first `IPv4`/`IPv6` token — the column we use to reject
+///   non-socket rows (`cwd`, `txt`, `REG`, `DIR`, …).
+/// * `USER` = everything between the `PID` and `FD`.
+/// * `NAME` = the socket path from the right side; we keep a row only when it
+///   reports `(LISTEN)` and carries the target port.
 pub fn parse_lsof_listen(output: &str, port: u16) -> Vec<LsofRow> {
     let port_spec = format!(":{port}");
     let mut rows = Vec::new();
@@ -73,25 +81,52 @@ pub fn parse_lsof_listen(output: &str, port: u16) -> Vec<LsofRow> {
             continue;
         }
         let tokens: Vec<&str> = line.split_whitespace().collect();
-        // Need at least: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE
-        if tokens.len() < 8 {
+
+        // The first IPv4/IPv6 token is the socket TYPE column. Everything at and
+        // right of it is strictly column-aligned, so indices relative to it are
+        // trustworthy even when COMMAND/USER contain spaces.
+        let Some(type_idx) = tokens.iter().position(|t| *t == "IPv4" || *t == "IPv6") else {
+            continue; // not a network socket descriptor (cwd, txt, REG, ...)
+        };
+        // Need at least: PID USER FD <TYPE> DEVICE SIZE/OFF ... NAME
+        if type_idx < 2 || type_idx + 3 >= tokens.len() {
             continue;
         }
-        let Ok(pid) = tokens[1].parse::<u32>() else {
+
+        // The PID is always the first purely-numeric token; COMMAND is whatever
+        // came before it (may contain spaces).
+        let Some(pid_idx) = tokens
+            .iter()
+            .position(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()))
+        else {
             continue;
         };
-        let socket_type = tokens[4];
-        if socket_type != "IPv4" && socket_type != "IPv6" {
-            continue; // not a network socket descriptor (cwd, txt, REG, ...)
+        let Ok(pid) = tokens[pid_idx].parse::<u32>() else {
+            continue;
+        };
+        if pid_idx >= type_idx {
+            continue; // the PID must sit before the socket columns
         }
-        let name = tokens[7..].join(" ");
+        let command = tokens[..pid_idx].join(" ");
+
+        // NAME is the socket path on the strictly-formatted right side.
+        let name = tokens[type_idx + 3..].join(" ");
         if !name.contains("(LISTEN)") || !name.contains(&port_spec) {
             continue; // established/outbound socket, or a different port
         }
+
+        // FD sits immediately before TYPE; USER is everything between the PID
+        // and FD (may contain spaces).
+        let fd_idx = type_idx - 1;
+        if pid_idx + 1 >= fd_idx {
+            continue;
+        }
+        let user = tokens[pid_idx + 1..fd_idx].join(" ");
+
         rows.push(LsofRow {
-            command: tokens[0].to_string(),
+            command,
             pid,
-            user: Some(tokens[2].to_string()),
+            user: Some(user),
             name,
         });
     }
@@ -279,6 +314,52 @@ vite    51204 alijoder   12u  IPv6  54321      0t0  TCP [::1]:3000 (LISTEN)
 
         assert_eq!(rows[1].pid, 51204);
         assert_eq!(rows[1].command, "vite");
+    }
+
+    // Regression: a COMMAND containing a space (e.g. "Google Chrome") used to
+    // shift every left-anchored column index, breaking PID/USER/NAME parsing.
+    #[test]
+    fn command_with_spaces_parses_correctly() {
+        let spaced = r#"COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME
+Google Chrome  44122 alijoder  21u  IPv4  12345  0t0  TCP 127.0.0.1:3000 (LISTEN)
+"#;
+        let rows = parse_lsof_listen(spaced, 3000);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].command, "Google Chrome");
+        assert_eq!(rows[0].pid, 44122);
+        assert_eq!(rows[0].user.as_deref(), Some("alijoder"));
+        assert!(rows[0].name.contains("127.0.0.1:3000"));
+    }
+
+    // Regression: a USER containing a space likewise used to break the fixed
+    // column indices, corrupting the NAME / socket-path extraction.
+    #[test]
+    fn user_with_spaces_parses_correctly() {
+        let spaced = r#"COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME
+node    44122 John Smith  21u  IPv4  12345  0t0  TCP 127.0.0.1:3000 (LISTEN)
+"#;
+        let rows = parse_lsof_listen(spaced, 3000);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].command, "node");
+        assert_eq!(rows[0].pid, 44122);
+        assert_eq!(rows[0].user.as_deref(), Some("John Smith"));
+        assert!(rows[0].name.contains("127.0.0.1:3000"));
+    }
+
+    // Both COMMAND and USER carrying spaces, including an IPv6 socket, in the
+    // same row — the hardest case the old index-based parser would fumble.
+    #[test]
+    fn command_and_user_with_spaces_over_ipv6() {
+        let spaced = r#"COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME
+Google Chrome  65432 John Smith  9u   IPv6  99999  0t0  TCP [::1]:3000 (LISTEN)
+"#;
+        let rows = parse_lsof_listen(spaced, 3000);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].command, "Google Chrome");
+        assert_eq!(rows[0].pid, 65432);
+        assert_eq!(rows[0].user.as_deref(), Some("John Smith"));
+        assert!(rows[0].name.contains("[::1]:3000"));
+        assert!(rows[0].name.contains("(LISTEN)"));
     }
 
     // Regression: the smoke test surfaced a false-positive bug where every open
