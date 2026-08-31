@@ -320,11 +320,11 @@ mod tests {
         let out = render_table(&[result], &TableOptions::new(RunMode::DryRun));
         assert!(out.contains("STATUS"), "dry run must show STATUS column");
         assert!(
-            out.contains("[Dry Run] Would send SIGTERM"),
+            out.contains(&format!("[Dry Run] Would send {}", SignalKind::Sigterm.name())),
             "missing badge:\n{out}"
         );
         assert!(out.contains("Dry run — no signals were sent."));
-        assert!(!out.contains("was sent SIGTERM"));
+        assert!(!out.contains(&format!("was sent {}", SignalKind::Sigterm.name())));
     }
 
     #[test]
@@ -334,14 +334,14 @@ mod tests {
         ok.processes[0].status = ProcessStatus::Terminated;
         ok.processes[0].signal = Some(SignalKind::Sigterm);
         let out = render_table(&[ok], &TableOptions::new(RunMode::Kill));
-        assert!(out.contains("Terminated (SIGTERM)"));
+        assert!(out.contains(&format!("Terminated ({})", SignalKind::Sigterm.name())));
         assert!(out.contains("✓ Port 3000 is now free."));
 
         let mut killed = occupied(5432, vec![bare(99, "postgres")]);
         killed.processes[0].status = ProcessStatus::Killed;
         killed.processes[0].signal = Some(SignalKind::Sigkill);
         let out = render_table(&[killed], &TableOptions::new(RunMode::Kill));
-        assert!(out.contains("Killed (SIGKILL)"));
+        assert!(out.contains(&format!("Killed ({})", SignalKind::Sigkill.name())));
     }
 
     #[test]

@@ -263,11 +263,21 @@ mod tests {
 
     #[test]
     fn signal_kind_names_and_display() {
-        assert_eq!(SignalKind::Sigterm.name(), "SIGTERM");
-        assert_eq!(SignalKind::Sigkill.name(), "SIGKILL");
-        assert_eq!(SignalKind::Sigterm.to_string(), "SIGTERM");
+        #[cfg(not(windows))]
+        {
+            assert_eq!(SignalKind::Sigterm.name(), "SIGTERM");
+            assert_eq!(SignalKind::Sigkill.name(), "SIGKILL");
+            assert_eq!(SignalKind::Sigterm.to_string(), "SIGTERM");
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(SignalKind::Sigterm.name(), "TERMINATEPROCESS");
+            assert_eq!(SignalKind::Sigkill.name(), "TERMINATEPROCESS");
+            assert_eq!(SignalKind::Sigterm.to_string(), "TERMINATEPROCESS");
+        }
         assert_eq!(SignalKind::from_force(true), SignalKind::Sigkill);
         assert_eq!(SignalKind::from_force(false), SignalKind::Sigterm);
+        assert_ne!(SignalKind::Sigterm, SignalKind::Sigkill);
     }
 
     #[test]
